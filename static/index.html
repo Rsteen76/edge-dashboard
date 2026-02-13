@@ -844,8 +844,10 @@ async function loadChart({ forceFit = false } = {}) {
     }
   }
 
-  // Add swing point lines
-  if (swingResp && Array.isArray(swingResp.swingPoints)) {
+  // Add swing point lines (as line series starting from swing timestamp)
+  if (swingResp && Array.isArray(swingResp.swingPoints) && candles.length > 0) {
+    const latestTime = candles[candles.length - 1].time;
+    
     for (const swingPoint of swingResp.swingPoints) {
       const price = Number(swingPoint.price);
       if (!Number.isFinite(price)) continue;
@@ -853,8 +855,10 @@ async function loadChart({ forceFit = false } = {}) {
       const type = String(swingPoint.type || '').toLowerCase();
       if (type !== 'high' && type !== 'low') continue;
 
+      const swingTime = Number(swingPoint.time);
+      if (!Number.isFinite(swingTime) || swingTime <= 0) continue;
+
       const timeframe = String(swingPoint.timeframe || '').toUpperCase();
-      const title = `${timeframe} ${type.toUpperCase()}`.trim();
       
       // Different colors for 5m vs 15m swings
       let color;
@@ -864,14 +868,23 @@ async function loadChart({ forceFit = false } = {}) {
         color = type === 'high' ? '#f85149' : '#a371f7';  // 15m: red high, purple low
       }
       
-      levelLines.push(candleSeries.createPriceLine({
-        price,
+      // Create a line series for this swing that starts from swing time
+      const swingLine = chart.addLineSeries({
         color,
         lineWidth: 1,
         lineStyle: LightweightCharts.LineStyle.Dashed,
-        axisLabelVisible: true,
-        title,
-      }));
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+      });
+      
+      // Draw line from swing time to current time
+      swingLine.setData([
+        { time: swingTime, value: price },
+        { time: latestTime, value: price }
+      ]);
+      
+      levelLines.push(swingLine);
     }
   }
 
