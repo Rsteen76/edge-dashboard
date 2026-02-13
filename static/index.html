@@ -855,9 +855,18 @@ async function loadChart({ forceFit = false } = {}) {
 
       const timeframe = String(swingPoint.timeframe || '').toUpperCase();
       const title = `${timeframe} ${type.toUpperCase()}`.trim();
+      
+      // Different colors for 5m vs 15m swings
+      let color;
+      if (timeframe === '5M') {
+        color = type === 'high' ? '#db6d28' : '#58a6ff';  // 5m: orange high, blue low
+      } else {
+        color = type === 'high' ? '#f85149' : '#a371f7';  // 15m: red high, purple low
+      }
+      
       levelLines.push(candleSeries.createPriceLine({
         price,
-        color: type === 'high' ? '#db6d28' : '#58a6ff',
+        color,
         lineWidth: 1,
         lineStyle: LightweightCharts.LineStyle.Dashed,
         axisLabelVisible: true,
