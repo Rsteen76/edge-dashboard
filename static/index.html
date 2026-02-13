@@ -855,8 +855,10 @@ async function loadChart({ forceFit = false } = {}) {
       const type = String(swingPoint.type || '').toLowerCase();
       if (type !== 'high' && type !== 'low') continue;
 
-      const swingTime = Number(swingPoint.time);
-      if (!Number.isFinite(swingTime) || swingTime <= 0) continue;
+      // Calculate time from timestamp (seconds for TradingView)
+      const timestampMs = Number(swingPoint.timestamp);
+      if (!Number.isFinite(timestampMs) || timestampMs <= 0) continue;
+      const swingTime = Math.floor(timestampMs / 1000);
 
       const timeframe = String(swingPoint.timeframe || '').toUpperCase();
       
