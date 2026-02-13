@@ -181,7 +181,7 @@ h2 { font-size:13px; font-weight:600; color:var(--dim); text-transform:uppercase
   </div>
 </div>
 
-<div class="footer">LSR Trading Dashboard • Auto-refresh 5s</div>
+<div class="footer">LSR Trading Dashboard • Real-time WS • Chart 60s</div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -190,178 +190,521 @@ const fmt = n => n == null ? '—' : Number(n).toLocaleString('en-US', {minimumF
 const pnlStr = n => (n >= 0 ? '+$' : '-$') + fmt(Math.abs(n));
 const pnlCls = n => n >= 0 ? 'pos' : 'neg';
 const pnlColor = n => n >= 0 ? 'var(--green)' : 'var(--red)';
+const WS_URL = 'ws://100.66.60.10:9998';
+const realtimeState = {
+  status: null,
+  account: null,
+  positions: [],
+  instruments: [],
+};
+let bridgeSocket = null;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let hasConnectedOnce = false;
+let activityRefreshTimer = null;
 
-async function refresh() {
-  // --- Status ---
-  const st = await api('/api/status');
-  if (st) {
-    const b = $('#badge');
-    b.textContent = st.status.toUpperCase();
-    b.className = 'badge badge-' + st.status;
+function touchUpdated() {
+  $('#updated').textContent = new Date().toLocaleTimeString();
+}
+
+function num(v, fallback = undefined) {
+  if (v == null || v === '') return fallback;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function normalizeSymbol(v) {
+  if (v == null) return '';
+  return String(v).trim().toUpperCase();
+}
+
+function normalizeAccount(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const normalized = {};
+  const balance = num(raw.balance ?? raw.CashValue ?? raw.NetLiquidation);
+  const realized = num(raw.realizedPnl);
+  const unrealized = num(raw.unrealizedPnl);
+  if (balance !== undefined) normalized.balance = balance;
+  if (realized !== undefined) normalized.realizedPnl = realized;
+  if (unrealized !== undefined) normalized.unrealizedPnl = unrealized;
+  return Object.keys(normalized).length ? normalized : null;
+}
+
+function normalizePosition(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const symbol = normalizeSymbol(raw.symbol ?? raw.instrument ?? raw.Symbol);
+  if (!symbol) return null;
+  const normalized = { symbol };
+  const direction = raw.direction ?? raw.marketPosition;
+  const quantity = num(raw.quantity ?? raw.qty ?? raw.position);
+  const avgPrice = num(raw.avgPrice ?? raw.averagePrice ?? raw.entryPrice);
+  const unrealizedPnl = num(raw.unrealizedPnl ?? raw.pnl ?? raw.unrealized);
+  const state = raw.state ?? raw.status;
+  if (direction != null) normalized.direction = direction;
+  if (quantity !== undefined) normalized.quantity = quantity;
+  if (avgPrice !== undefined) normalized.avgPrice = avgPrice;
+  if (unrealizedPnl !== undefined) normalized.unrealizedPnl = unrealizedPnl;
+  if ('sl' in raw || 'stopLoss' in raw || 'stopPrice' in raw) {
+    const slRaw = raw.sl ?? raw.stopLoss ?? raw.stopPrice;
+    normalized.sl = slRaw == null ? null : num(slRaw, null);
   }
-
-  // --- Account ---
-  const acc = await api('/api/account');
-  if (acc && !acc.error) {
-    const bal = acc.balance ?? acc.CashValue ?? acc.NetLiquidation ?? 0;
-    const real = acc.realizedPnl ?? 0;
-    const unreal = acc.unrealizedPnl ?? 0;
-    $('#balance').textContent = '$' + fmt(bal);
-    const rEl = $('#realized');
-    rEl.textContent = pnlStr(real);
-    rEl.className = 'stat-val ' + pnlCls(real);
-    const uEl = $('#unrealized');
-    uEl.textContent = pnlStr(unreal);
-    uEl.className = 'stat-val ' + pnlCls(unreal);
+  if ('tp' in raw || 'takeProfit' in raw || 'targetPrice' in raw || 'limitPrice' in raw) {
+    const tpRaw = raw.tp ?? raw.takeProfit ?? raw.targetPrice ?? raw.limitPrice;
+    normalized.tp = tpRaw == null ? null : num(tpRaw, null);
   }
+  if (state != null) normalized.state = String(state).toLowerCase();
+  return normalized;
+}
 
-  // --- Positions ---
-  const posData = await api('/api/positions');
+function normalizeInstrument(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const symbol = normalizeSymbol(raw.symbol ?? raw.instrument ?? raw.Symbol);
+  if (!symbol) return null;
+  const normalized = { symbol };
+  const last = num(raw.last ?? raw.lastPrice ?? raw.price ?? raw.close);
+  const bid = num(raw.bid);
+  const ask = num(raw.ask);
+  const pdh = num(raw.pdh ?? raw.PDH);
+  const pdl = num(raw.pdl ?? raw.PDL);
+  const pdc = num(raw.pdc ?? raw.PDC);
+  const pnl = num(raw.pnl ?? raw.unrealizedPnl ?? raw.positionPnl ?? raw.dailyPnl);
+  if (last !== undefined) normalized.last = last;
+  if (bid !== undefined) normalized.bid = bid;
+  if (ask !== undefined) normalized.ask = ask;
+  if (pdh !== undefined) normalized.pdh = pdh;
+  if (pdl !== undefined) normalized.pdl = pdl;
+  if (pdc !== undefined) normalized.pdc = pdc;
+  if (pnl !== undefined) normalized.pnl = pnl;
+  return Object.keys(normalized).length > 1 ? normalized : null;
+}
+
+function mergeBySymbol(existing, updates) {
+  const merged = existing.map(x => ({ ...x }));
+  const idx = new Map(merged.map((x, i) => [x.symbol, i]));
+  updates.forEach(u => {
+    if (!u || !u.symbol) return;
+    const i = idx.get(u.symbol);
+    if (i == null) {
+      idx.set(u.symbol, merged.length);
+      merged.push(u);
+    } else {
+      merged[i] = { ...merged[i], ...u };
+    }
+  });
+  return merged;
+}
+
+function renderStatus(st) {
+  if (!st) return;
+  const b = $('#badge');
+  const status = String(st.status || 'unknown').toLowerCase();
+  b.textContent = status.toUpperCase();
+  b.className = 'badge badge-' + status;
+}
+
+function renderAccount(acc) {
+  if (!acc) return;
+  $('#balance').textContent = '$' + fmt(acc.balance ?? 0);
+  const rEl = $('#realized');
+  rEl.textContent = pnlStr(acc.realizedPnl ?? 0);
+  rEl.className = 'stat-val ' + pnlCls(acc.realizedPnl ?? 0);
+  const uEl = $('#unrealized');
+  uEl.textContent = pnlStr(acc.unrealizedPnl ?? 0);
+  uEl.className = 'stat-val ' + pnlCls(acc.unrealizedPnl ?? 0);
+}
+
+function renderPositions(posList) {
   const posDiv = $('#positions');
-  const posList = posData?.positions ?? [];
   $('#posCount').textContent = posList.length;
-
-  if (posList.length > 0) {
-    posDiv.innerHTML = posList.map(p => {
-      const dir = p.direction || (p.quantity > 0 ? 'Long' : 'Short');
-      const dirCls = dir === 'Long' ? 'pos-long' : 'pos-short';
-      const pnl = p.unrealizedPnl ?? 0;
-      const sl = p.sl != null ? fmt(p.sl) : '—';
-      const tp = p.tp != null ? fmt(p.tp) : '—';
-      return `<div class="pos-row">
-        <div class="pos-info">
-          <span class="pos-sym">${p.symbol}</span>
-          <span class="pos-dir ${dirCls}">${dir.toUpperCase()}</span>
-          <span class="pos-detail">
-            Entry ${fmt(p.avgPrice)}<span class="hide-m"> · SL ${sl} · TP ${tp}</span>
-          </span>
-        </div>
-        <div class="pos-pnl" style="color:${pnlColor(pnl)}">${pnlStr(pnl)}</div>
-      </div>`;
-    }).join('');
-  } else {
+  if (!posList.length) {
     posDiv.innerHTML = '<div style="color:var(--dim);padding:12px 0;">Flat — no open positions</div>';
+    return;
   }
 
-  // --- Levels / Instruments ---
-  const lvl = await api('/api/levels');
+  posDiv.innerHTML = posList.map(p => {
+    const dir = p.direction || (p.quantity > 0 ? 'Long' : 'Short');
+    const dirCls = String(dir).toLowerCase() === 'long' ? 'pos-long' : 'pos-short';
+    const pnl = p.unrealizedPnl ?? 0;
+    const sl = p.sl != null ? fmt(p.sl) : '—';
+    const tp = p.tp != null ? fmt(p.tp) : '—';
+    return `<div class="pos-row">
+      <div class="pos-info">
+        <span class="pos-sym">${p.symbol}</span>
+        <span class="pos-dir ${dirCls}">${String(dir).toUpperCase()}</span>
+        <span class="pos-detail">
+          Entry ${fmt(p.avgPrice)}<span class="hide-m"> · SL ${sl} · TP ${tp}</span>
+        </span>
+      </div>
+      <div class="pos-pnl" style="color:${pnlColor(pnl)}">${pnlStr(pnl)}</div>
+    </div>`;
+  }).join('');
+}
+
+function instrumentCardHtml(i) {
+  const price = i.last != null ? fmt(i.last) : '—';
+  let priceColor = 'var(--text)';
+  if (i.last != null && i.pdc != null) {
+    priceColor = i.last > i.pdc ? 'var(--green)' : i.last < i.pdc ? 'var(--red)' : 'var(--text)';
+  }
+
+  let distHtml = '';
+  if (i.last != null && i.pdh != null && i.pdl != null && i.last !== 0) {
+    const toH = ((i.pdh - i.last) / i.last * 100).toFixed(2);
+    const toL = ((i.last - i.pdl) / i.last * 100).toFixed(2);
+    distHtml = `<div class="inst-row" style="margin-top:6px;"><span class="inst-label">↑ PDH</span><span class="inst-val" style="font-size:11px;color:var(--dim)">${toH}%</span></div>
+      <div class="inst-row"><span class="inst-label">↓ PDL</span><span class="inst-val" style="font-size:11px;color:var(--dim)">${toL}%</span></div>`;
+  }
+
+  const hasPnl = i.pnl != null;
+  const pnlText = hasPnl ? pnlStr(i.pnl) : '—';
+  const pnlStyle = hasPnl ? `color:${pnlColor(i.pnl)}` : 'color:var(--dim)';
+
+  return `<div class="inst" data-symbol="${i.symbol}">
+    <div class="inst-sym">${i.symbol}</div>
+    <div class="inst-price" style="color:${priceColor}">${price}</div>
+    <div class="inst-row"><span class="inst-label">P&L</span><span class="inst-val" style="${pnlStyle}">${pnlText}</span></div>
+    <div class="inst-row"><span class="inst-label">PDH</span><span class="inst-val pdh">${fmt(i.pdh)}</span></div>
+    <div class="inst-row"><span class="inst-label">PDL</span><span class="inst-val pdl">${fmt(i.pdl)}</span></div>
+    <div class="inst-row"><span class="inst-label">PDC</span><span class="inst-val pdc">${fmt(i.pdc)}</span></div>
+    ${distHtml}
+  </div>`;
+}
+
+function renderInstruments(instList) {
   const instDiv = $('#instruments');
-  if (lvl?.instruments?.length) {
-    instDiv.innerHTML = lvl.instruments.map(i => {
-      const price = i.last != null ? fmt(i.last) : '—';
-      let pc = 'var(--text)';
-      if (i.last != null && i.pdc != null) pc = i.last > i.pdc ? 'var(--green)' : i.last < i.pdc ? 'var(--red)' : 'var(--text)';
-      // Distance indicators
-      let distHtml = '';
-      if (i.last != null) {
-        const toH = ((i.pdh - i.last) / i.last * 100).toFixed(2);
-        const toL = ((i.last - i.pdl) / i.last * 100).toFixed(2);
-        distHtml = `<div class="inst-row" style="margin-top:6px;"><span class="inst-label">↑ PDH</span><span class="inst-val" style="font-size:11px;color:var(--dim)">${toH}%</span></div>
-          <div class="inst-row"><span class="inst-label">↓ PDL</span><span class="inst-val" style="font-size:11px;color:var(--dim)">${toL}%</span></div>`;
-      }
-      return `<div class="inst">
-        <div class="inst-sym">${i.symbol}</div>
-        <div class="inst-price" style="color:${pc}">${price}</div>
-        <div class="inst-row"><span class="inst-label">PDH</span><span class="inst-val pdh">${fmt(i.pdh)}</span></div>
-        <div class="inst-row"><span class="inst-label">PDL</span><span class="inst-val pdl">${fmt(i.pdl)}</span></div>
-        <div class="inst-row"><span class="inst-label">PDC</span><span class="inst-val pdc">${fmt(i.pdc)}</span></div>
-        ${distHtml}
-      </div>`;
-    }).join('');
-  } else {
+  if (!instList.length) {
     instDiv.innerHTML = '<div style="color:var(--dim)">No level data</div>';
+    return;
   }
+  instDiv.innerHTML = instList.map(instrumentCardHtml).join('');
+}
 
+function upsertInstrumentCard(inst) {
+  const instDiv = $('#instruments');
+  if (!instDiv || !inst || !inst.symbol) return;
+  if (!instDiv.querySelector('.inst')) instDiv.innerHTML = '';
+
+  const existing = instDiv.querySelector(`.inst[data-symbol="${inst.symbol}"]`);
+  const html = instrumentCardHtml(inst);
+  if (existing) {
+    existing.outerHTML = html;
+  } else {
+    instDiv.insertAdjacentHTML('beforeend', html);
+  }
+}
+
+function applyStatus(st) {
+  if (!st) return;
+  realtimeState.status = st;
+  renderStatus(st);
+  touchUpdated();
+}
+
+function applyAccountUpdate(raw) {
+  const normalized = normalizeAccount(raw);
+  if (!normalized) return;
+  realtimeState.account = { ...(realtimeState.account || {}), ...normalized };
+  renderAccount(realtimeState.account);
+  touchUpdated();
+}
+
+function applyPositionsUpdate(input, { replace = false } = {}) {
+  const updates = (Array.isArray(input) ? input : [input])
+    .map(normalizePosition)
+    .filter(Boolean);
+  if (!updates.length && !replace) return;
+
+  if (replace) {
+    realtimeState.positions = updates.filter(p => p.quantity !== 0 && p.state !== 'flat');
+  } else {
+    const map = new Map(realtimeState.positions.map(p => [p.symbol, p]));
+    updates.forEach(p => {
+      if (p.quantity === 0 || p.state === 'flat' || p.state === 'closed') {
+        map.delete(p.symbol);
+      } else {
+        map.set(p.symbol, { ...(map.get(p.symbol) || {}), ...p });
+      }
+    });
+    realtimeState.positions = Array.from(map.values());
+  }
+  renderPositions(realtimeState.positions);
+  touchUpdated();
+}
+
+function applyInstrumentsUpdate(input, { replace = false } = {}) {
+  const updates = (Array.isArray(input) ? input : [input])
+    .map(normalizeInstrument)
+    .filter(Boolean);
+  if (!updates.length && !replace) return;
+
+  if (replace) {
+    realtimeState.instruments = updates;
+    renderInstruments(realtimeState.instruments);
+  } else {
+    realtimeState.instruments = mergeBySymbol(realtimeState.instruments, updates);
+    const bySymbol = new Map(realtimeState.instruments.map(i => [i.symbol, i]));
+    updates.forEach(u => {
+      const merged = bySymbol.get(u.symbol);
+      if (merged) upsertInstrumentCard(merged);
+    });
+  }
+  touchUpdated();
+}
+
+async function updatePrices() {
+  const [st, acc, posData, lvl] = await Promise.all([
+    api('/api/status'),
+    api('/api/account'),
+    api('/api/positions'),
+    api('/api/levels'),
+  ]);
+
+  if (st) applyStatus(st);
+  if (acc && !acc.error) applyAccountUpdate(acc);
+  if (posData && Array.isArray(posData.positions)) applyPositionsUpdate(posData.positions, { replace: true });
+  if (lvl && Array.isArray(lvl.instruments)) applyInstrumentsUpdate(lvl.instruments, { replace: true });
+}
+
+async function refreshActivity() {
   // --- Trades ---
   const trData = await api('/api/trades');
   const tradesDiv = $('#trades');
   const summaryDiv = $('#summary');
-  const trades = trData?.trades ?? [];
-  const summary = trData?.summary ?? {};
+  if (trData && Array.isArray(trData.trades)) {
+    const trades = trData.trades;
+    const summary = trData.summary ?? {};
 
-  // Summary bar
-  if (summary.total > 0 || trades.length > 0) {
-    const open = trades.filter(t => t.status === 'open').length;
-    const pending = trades.filter(t => t.status === 'pending').length;
-    summaryDiv.innerHTML = `
-      <span class="summary-stat"><span class="summary-dot" style="background:var(--green)"></span> ${summary.wins || 0}W</span>
-      <span class="summary-stat"><span class="summary-dot" style="background:var(--red)"></span> ${summary.losses || 0}L</span>
-      ${summary.total ? `<span style="color:var(--dim)">|</span><span style="color:${pnlColor(summary.pnl)};font-weight:700">${pnlStr(summary.pnl)}</span>` : ''}
-      ${summary.winRate ? `<span style="color:var(--dim)">${summary.winRate}%</span>` : ''}
-      ${open ? `<span style="color:var(--dim)">|</span><span style="color:var(--blue)">${open} open</span>` : ''}
-      ${pending ? `<span style="color:var(--yellow)">${pending} pending</span>` : ''}
-    `;
-  } else {
-    summaryDiv.innerHTML = '';
-  }
+    // Summary bar
+    if (summary.total > 0 || trades.length > 0) {
+      const open = trades.filter(t => t.status === 'open').length;
+      const pending = trades.filter(t => t.status === 'pending').length;
+      summaryDiv.innerHTML = `
+        <span class="summary-stat"><span class="summary-dot" style="background:var(--green)"></span> ${summary.wins || 0}W</span>
+        <span class="summary-stat"><span class="summary-dot" style="background:var(--red)"></span> ${summary.losses || 0}L</span>
+        ${summary.total ? `<span style="color:var(--dim)">|</span><span style="color:${pnlColor(summary.pnl)};font-weight:700">${pnlStr(summary.pnl)}</span>` : ''}
+        ${summary.winRate ? `<span style="color:var(--dim)">${summary.winRate}%</span>` : ''}
+        ${open ? `<span style="color:var(--dim)">|</span><span style="color:var(--blue)">${open} open</span>` : ''}
+        ${pending ? `<span style="color:var(--yellow)">${pending} pending</span>` : ''}
+      `;
+    } else {
+      summaryDiv.innerHTML = '';
+    }
 
-  // Trade list (reverse: newest first)
-  if (trades.length > 0) {
-    tradesDiv.innerHTML = [...trades].reverse().map(t => {
-      const sym = t.symbol || '?';
-      const side = t.side || '';
-      const sideColor = side === 'BUY' ? 'var(--green)' : side === 'SELL' ? 'var(--red)' : 'var(--dim)';
-      const sideBg = side === 'BUY' ? 'rgba(63,185,80,0.15)' : side === 'SELL' ? 'rgba(248,81,73,0.15)' : 'transparent';
-      const time = t.time || '';
-      const session = t.session || '';
+    // Trade list (reverse: newest first)
+    if (trades.length > 0) {
+      tradesDiv.innerHTML = [...trades].reverse().map(t => {
+        const sym = t.symbol || '?';
+        const side = t.side || '';
+        const sideColor = side === 'BUY' ? 'var(--green)' : side === 'SELL' ? 'var(--red)' : 'var(--dim)';
+        const sideBg = side === 'BUY' ? 'rgba(63,185,80,0.15)' : side === 'SELL' ? 'rgba(248,81,73,0.15)' : 'transparent';
+        const time = t.time || '';
+        const session = t.session || '';
 
-      let statusHtml = '';
-      let pnlHtml = '';
+        let statusHtml = '';
+        let pnlHtml = '';
 
-      if (t.status === 'open') {
-        statusHtml = '<span class="trade-status st-open">OPEN</span>';
-        const pnl = t.pnl || 0;
-        pnlHtml = `<span class="trade-pnl" style="color:${pnlColor(pnl)}">${pnlStr(pnl)}</span>`;
-      } else if (t.status === 'closed') {
-        const icon = t.result === 'win' ? '✅' : '❌';
-        statusHtml = `<span class="trade-status st-closed">${icon} ${(t.result||'').toUpperCase()}</span>`;
-        pnlHtml = `<span class="trade-pnl" style="color:${pnlColor(t.pnl)}">${pnlStr(t.pnl)} <span style="font-size:10px;color:var(--dim)">${t.r_actual > 0 ? '+' : ''}${(t.r_actual||0).toFixed(1)}R</span></span>`;
-      } else if (t.status === 'cancelled') {
-        statusHtml = '<span class="trade-status st-cancelled">EXPIRED</span>';
-        pnlHtml = '<span style="color:var(--dim)">—</span>';
-      } else if (t.status === 'pending') {
-        statusHtml = '<span class="trade-status st-pending">PENDING</span>';
-        pnlHtml = '<span style="color:var(--dim)">—</span>';
-      }
+        if (t.status === 'open') {
+          statusHtml = '<span class="trade-status st-open">OPEN</span>';
+          const pnl = t.pnl || 0;
+          pnlHtml = `<span class="trade-pnl" style="color:${pnlColor(pnl)}">${pnlStr(pnl)}</span>`;
+        } else if (t.status === 'closed') {
+          const icon = t.result === 'win' ? '✅' : '❌';
+          statusHtml = `<span class="trade-status st-closed">${icon} ${(t.result||'').toUpperCase()}</span>`;
+          pnlHtml = `<span class="trade-pnl" style="color:${pnlColor(t.pnl)}">${pnlStr(t.pnl)} <span style="font-size:10px;color:var(--dim)">${t.r_actual > 0 ? '+' : ''}${(t.r_actual||0).toFixed(1)}R</span></span>`;
+        } else if (t.status === 'cancelled') {
+          statusHtml = '<span class="trade-status st-cancelled">EXPIRED</span>';
+          pnlHtml = '<span style="color:var(--dim)">—</span>';
+        } else if (t.status === 'pending') {
+          statusHtml = '<span class="trade-status st-pending">PENDING</span>';
+          pnlHtml = '<span style="color:var(--dim)">—</span>';
+        }
 
-      return `<div class="trade-row">
-        <div class="trade-left">
-          <span class="trade-sym">${sym}</span>
-          ${side ? `<span class="trade-side" style="color:${sideColor};background:${sideBg}">${side}</span>` : ''}
-          <span class="trade-meta">${fmt(t.price)}${t.rr ? ` · ${t.rr}R` : ''}${session ? ` · ${session}` : ''}${time ? ` · ${time}` : ''}</span>
-        </div>
-        <div style="display:flex;gap:10px;align-items:center;">
-          ${statusHtml}
-          ${pnlHtml}
-        </div>
-      </div>`;
-    }).join('');
-  } else {
-    tradesDiv.innerHTML = '<div style="color:var(--dim);padding:12px 0;">No trades this session</div>';
+        return `<div class="trade-row">
+          <div class="trade-left">
+            <span class="trade-sym">${sym}</span>
+            ${side ? `<span class="trade-side" style="color:${sideColor};background:${sideBg}">${side}</span>` : ''}
+            <span class="trade-meta">${fmt(t.price)}${t.rr ? ` · ${t.rr}R` : ''}${session ? ` · ${session}` : ''}${time ? ` · ${time}` : ''}</span>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;">
+            ${statusHtml}
+            ${pnlHtml}
+          </div>
+        </div>`;
+      }).join('');
+    } else {
+      tradesDiv.innerHTML = '<div style="color:var(--dim);padding:12px 0;">No trades this session</div>';
+    }
   }
 
   // --- Signals ---
   const sig = await api('/api/signals');
   const feed = $('#signals');
-  if (sig?.signals?.length) {
-    feed.innerHTML = sig.signals.map(s => {
-      let c = '';
-      if (/FILLED|LONG|BUY|✅/i.test(s)) c = 'color:var(--green)';
-      else if (/SL|STOP|EXIT|SHORT|SELL|❌|Cancel/i.test(s)) c = 'color:var(--red)';
-      else if (/PLACING|ORDER|LIMIT/i.test(s)) c = 'color:var(--blue)';
-      else if (/Startup|levels/i.test(s)) c = 'color:var(--yellow)';
-      return `<div class="sig" style="${c}">${s}</div>`;
-    }).join('');
-    feed.scrollTop = feed.scrollHeight;
-  } else {
-    feed.innerHTML = '<div style="color:var(--dim)">No signals</div>';
+  if (sig && Array.isArray(sig.signals)) {
+    if (sig.signals.length) {
+      feed.innerHTML = sig.signals.map(s => {
+        let c = '';
+        if (/FILLED|LONG|BUY|✅/i.test(s)) c = 'color:var(--green)';
+        else if (/SL|STOP|EXIT|SHORT|SELL|❌|Cancel/i.test(s)) c = 'color:var(--red)';
+        else if (/PLACING|ORDER|LIMIT/i.test(s)) c = 'color:var(--blue)';
+        else if (/Startup|levels/i.test(s)) c = 'color:var(--yellow)';
+        return `<div class="sig" style="${c}">${s}</div>`;
+      }).join('');
+      feed.scrollTop = feed.scrollHeight;
+    } else {
+      feed.innerHTML = '<div style="color:var(--dim)">No signals</div>';
+    }
+  }
+}
+
+function scheduleActivityRefresh(delay = 250) {
+  if (activityRefreshTimer) clearTimeout(activityRefreshTimer);
+  activityRefreshTimer = setTimeout(() => {
+    activityRefreshTimer = null;
+    refreshActivity().catch(() => null);
+  }, delay);
+}
+
+function handleRealtimePayload(payload, parentType = '') {
+  if (Array.isArray(payload)) {
+    payload.forEach(item => handleRealtimePayload(item, parentType));
+    return;
+  }
+  if (!payload || typeof payload !== 'object') return;
+
+  const type = String(payload.type ?? payload.topic ?? payload.event ?? parentType ?? '').toLowerCase();
+  const data = payload.data ?? payload.payload;
+  if (data && data !== payload && (typeof data === 'object' || Array.isArray(data))) {
+    handleRealtimePayload(data, type);
   }
 
-  $('#updated').textContent = new Date().toLocaleTimeString();
+  if (payload.status && typeof payload.status === 'object') {
+    applyStatus(payload.status);
+  } else if (type.includes('status') && typeof payload.status === 'string') {
+    applyStatus(payload);
+  }
+
+  const accountPayload = payload.account ?? payload.accountData ?? payload.Account;
+  if (accountPayload) {
+    applyAccountUpdate(accountPayload);
+  } else if (type.includes('account')) {
+    applyAccountUpdate(payload);
+  }
+
+  if (Array.isArray(payload.positions)) {
+    applyPositionsUpdate(payload.positions, { replace: Boolean(payload.snapshot || payload.full) });
+  } else if (payload.position) {
+    applyPositionsUpdate(payload.position);
+  } else if (type.includes('position')) {
+    applyPositionsUpdate(payload);
+  }
+
+  if (Array.isArray(payload.instruments)) {
+    applyInstrumentsUpdate(payload.instruments, { replace: Boolean(payload.snapshot || payload.full) });
+  }
+  if (Array.isArray(payload.prices)) {
+    applyInstrumentsUpdate(payload.prices, { replace: Boolean(payload.snapshot || payload.full) });
+  }
+  if (Array.isArray(payload.quotes)) {
+    applyInstrumentsUpdate(payload.quotes, { replace: Boolean(payload.snapshot || payload.full) });
+  }
+  if (payload.instrument) applyInstrumentsUpdate(payload.instrument);
+  if (payload.quote) applyInstrumentsUpdate(payload.quote);
+  if (payload.price && typeof payload.price === 'object') {
+    applyInstrumentsUpdate({ ...payload.price, symbol: payload.symbol ?? payload.instrument ?? payload.price.symbol });
+  }
+
+  const hasPriceLikeFields = payload.symbol && (
+    payload.last != null ||
+    payload.lastPrice != null ||
+    payload.price != null ||
+    payload.close != null ||
+    payload.bid != null ||
+    payload.ask != null ||
+    payload.pnl != null ||
+    payload.unrealizedPnl != null
+  );
+  if (hasPriceLikeFields) applyInstrumentsUpdate(payload);
+
+  if (payload.levels && Array.isArray(payload.levels.instruments)) {
+    applyInstrumentsUpdate(payload.levels.instruments, { replace: true });
+  }
+
+  if (
+    Array.isArray(payload.orders) ||
+    payload.order ||
+    type.includes('order') ||
+    type.includes('trade') ||
+    type.includes('signal')
+  ) {
+    scheduleActivityRefresh();
+  }
+}
+
+function handleRealtimeMessage(raw) {
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+  }
+  handleRealtimePayload(parsed);
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  const delay = Math.min(1000 * (2 ** reconnectAttempts), 15000);
+  reconnectAttempts += 1;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectBridgeSocket();
+  }, delay);
+}
+
+function connectBridgeSocket() {
+  if (typeof WebSocket === 'undefined') return;
+  if (bridgeSocket && (bridgeSocket.readyState === WebSocket.OPEN || bridgeSocket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  try {
+    bridgeSocket = new WebSocket(WS_URL);
+  } catch {
+    scheduleReconnect();
+    return;
+  }
+
+  bridgeSocket.onopen = () => {
+    reconnectAttempts = 0;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (hasConnectedOnce) refresh().catch(() => null);
+    hasConnectedOnce = true;
+  };
+
+  bridgeSocket.onmessage = ev => {
+    handleRealtimeMessage(ev.data);
+  };
+
+  bridgeSocket.onerror = () => {
+    if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) bridgeSocket.close();
+  };
+
+  bridgeSocket.onclose = () => {
+    bridgeSocket = null;
+    scheduleReconnect();
+  };
+}
+
+async function refresh() {
+  await Promise.all([updatePrices(), refreshActivity()]);
 }
 
 refresh();
-setInterval(refresh, 5000);
+connectBridgeSocket();
 
 // --- Chart ---
 let chart = null;
@@ -373,6 +716,8 @@ let levelLines = [];
 let tradeMarkers = [];
 let activeSymbol = 'ES';
 let activeTf = '5m';
+let previousChartKey = null;
+let latestChartLoadId = 0;
 const SYMBOLS = ['ES', 'NQ', 'CL', 'GC', 'SI'];
 
 function initChart() {
@@ -408,7 +753,7 @@ function initChart() {
     const btn = document.createElement('button');
     btn.className = 'chart-btn' + (s === activeSymbol ? ' active' : '');
     btn.textContent = s;
-    btn.onclick = () => { activeSymbol = s; updateChartBtns(); loadChart(); };
+    btn.onclick = () => { activeSymbol = s; updateChartBtns(); loadChart({ forceFit: true }); };
     btnDiv.appendChild(btn);
   });
 
@@ -418,12 +763,12 @@ function initChart() {
       activeTf = btn.dataset.tf;
       document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
-      loadChart();
+      loadChart({ forceFit: true });
     };
   });
 
-  loadChart();
-  setInterval(loadChart, 30000);
+  loadChart({ forceFit: true });
+  setInterval(() => loadChart(), 60000);
 }
 
 function updateChartBtns() {
@@ -432,27 +777,42 @@ function updateChartBtns() {
   });
 }
 
-async function loadChart() {
+async function loadChart({ forceFit = false } = {}) {
   if (!chart || !candleSeries) return;
 
-  const hours = activeTf === '1h' ? 72 : activeTf === '15m' ? 48 : 24;
-  const data = await api(`/api/candles?symbol=${activeSymbol}&tf=${activeTf}&hours=${hours}`);
+  const chartLoadId = ++latestChartLoadId;
+  const symbol = activeSymbol;
+  const tf = activeTf;
+  const hours = tf === '1h' ? 72 : tf === '15m' ? 48 : 24;
+  const data = await api(`/api/candles?symbol=${symbol}&tf=${tf}&hours=${hours}`);
+  if (chartLoadId !== latestChartLoadId || symbol !== activeSymbol || tf !== activeTf) return;
   if (!data || !data.candles || !data.candles.length) return;
 
   candleSeries.setData(data.candles);
   ema20Series.setData(data.ema20 || []);
   ema50Series.setData(data.ema50 || []);
   ema200Series.setData(data.ema200 || []);
-  chart.timeScale().fitContent();
+  const chartKey = `${symbol}:${tf}`;
+  if (forceFit || previousChartKey !== chartKey) {
+    chart.timeScale().fitContent();
+    previousChartKey = chartKey;
+  }
+
+  const [lvl, swingResp, orderResp, tr] = await Promise.all([
+    api('/api/levels'),
+    api(`/api/swing-points?symbol=${symbol}`),
+    api('/api/orders'),
+    api('/api/trades'),
+  ]);
+  if (chartLoadId !== latestChartLoadId || symbol !== activeSymbol || tf !== activeTf) return;
 
   // Remove old level lines
   levelLines.forEach(l => candleSeries.removePriceLine(l));
   levelLines = [];
 
   // Add PDH/PDL/PDC lines
-  const lvl = await api('/api/levels');
   if (lvl && lvl.instruments) {
-    const inst = lvl.instruments.find(i => i.symbol === activeSymbol);
+    const inst = lvl.instruments.find(i => i.symbol === symbol);
     if (inst) {
       if (inst.pdh) levelLines.push(candleSeries.createPriceLine({ price: inst.pdh, color: '#3fb950', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'PDH' }));
       if (inst.pdl) levelLines.push(candleSeries.createPriceLine({ price: inst.pdl, color: '#f85149', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'PDL' }));
@@ -461,7 +821,6 @@ async function loadChart() {
   }
 
   // Add swing point lines
-  const swingResp = await api(`/api/swing-points?symbol=${activeSymbol}`);
   if (swingResp && Array.isArray(swingResp.swingPoints)) {
     for (const swingPoint of swingResp.swingPoints) {
       const price = Number(swingPoint.price);
@@ -483,41 +842,46 @@ async function loadChart() {
     }
   }
 
-  // Add pending working limit order lines
-  const orderResp = await api('/api/orders');
+  // Add pending working order lines
   if (orderResp && orderResp.orders) {
-    const pendingLimitOrders = orderResp.orders.filter(o =>
+    const workingOrders = orderResp.orders.filter(o =>
       o &&
-      o.symbol === activeSymbol &&
-      String(o.state || '').toLowerCase() === 'working' &&
-      String(o.orderType || '').toLowerCase() === 'limit'
+      o.symbol === symbol &&
+      String(o.state || '').toLowerCase() === 'working'
     );
 
-    for (const order of pendingLimitOrders) {
-      const orderPrice = Number(order.price);
+    for (const order of workingOrders) {
+      const orderType = String(order.orderType || '').toLowerCase();
+      const orderPrice = Number(order.price ?? order.stopPrice ?? order.limitPrice);
       if (!Number.isFinite(orderPrice)) continue;
 
       const action = String(order.action || '').toUpperCase();
-      const isBuy = action.includes('BUY');
-      const isSell = action.includes('SELL');
-      if (!isBuy && !isSell) continue;
+      let color = '#58a6ff';
+      let titlePrefix = String(order.orderType || 'ORDER').toUpperCase();
+      if (orderType === 'stopmarket') {
+        color = '#f85149';
+        titlePrefix = 'SL';
+      } else if (orderType === 'limit') {
+        color = '#3fb950';
+        titlePrefix = 'TP';
+      }
+      const actionPrefix = action ? `${action} ` : '';
 
       levelLines.push(candleSeries.createPriceLine({
         price: orderPrice,
-        color: isBuy ? '#3fb950' : '#f85149',
-        lineWidth: 2,
-        lineStyle: LightweightCharts.LineStyle.Solid,
+        color,
+        lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed,
         axisLabelVisible: true,
-        title: `${isBuy ? 'BUY' : 'SELL'} LIMIT @ ${fmt(orderPrice)}`,
+        title: `${titlePrefix} ${actionPrefix}@ ${fmt(orderPrice)}`,
       }));
     }
   }
 
   // Trade markers from session trades
-  const tr = await api('/api/trades');
   if (tr && tr.trades) {
     const markers = [];
-    const symTrades = tr.trades.filter(t => t.symbol === activeSymbol && t.price);
+    const symTrades = tr.trades.filter(t => t.symbol === symbol && t.price);
     for (const t of symTrades) {
       // Find nearest candle time for this trade
       const last = data.candles[data.candles.length - 1];
