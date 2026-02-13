@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LSR Trading Dashboard</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 :root {
   --bg: #0d1117; --card: #161b22; --border: #30363d;
@@ -103,7 +104,20 @@ h2 { font-size:13px; font-weight:600; color:var(--dim); text-transform:uppercase
   .inst-price { font-size:18px; }
   .pos-pnl { font-size:14px; }
   .hide-m { display:none; }
+  .chart-wrap { height:300px; }
 }
+
+/* Chart */
+.chart-wrap { height:450px; position:relative; }
+.chart-btns { display:flex; gap:6px; margin-bottom:10px; flex-wrap:wrap; }
+.chart-btn { background:var(--bg); border:1px solid var(--border); color:var(--dim); padding:4px 14px;
+  border-radius:4px; cursor:pointer; font-family:var(--font); font-size:12px; font-weight:600; }
+.chart-btn.active { background:rgba(88,166,255,0.15); color:var(--blue); border-color:var(--blue); }
+.chart-btn:hover { border-color:var(--blue); }
+.tf-btns { display:flex; gap:4px; margin-left:auto; }
+.tf-btn { background:var(--bg); border:1px solid var(--border); color:var(--dim); padding:3px 8px;
+  border-radius:3px; cursor:pointer; font-family:var(--font); font-size:10px; }
+.tf-btn.active { color:var(--blue); border-color:var(--blue); }
 </style>
 </head>
 <body>
@@ -128,6 +142,23 @@ h2 { font-size:13px; font-weight:600; color:var(--dim); text-transform:uppercase
   <div class="card full">
     <h2>📊 Instruments</h2>
     <div class="instruments" id="instruments"><div style="color:var(--dim)">Loading…</div></div>
+  </div>
+
+  <!-- Chart -->
+  <div class="card full">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+      <h2 style="margin:0;">📈 Chart</h2>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+        <div class="chart-btns" id="chart-btns"></div>
+        <div class="tf-btns">
+          <button class="tf-btn" data-tf="1m">1m</button>
+          <button class="tf-btn active" data-tf="5m">5m</button>
+          <button class="tf-btn" data-tf="15m">15m</button>
+          <button class="tf-btn" data-tf="1h">1h</button>
+        </div>
+      </div>
+    </div>
+    <div class="chart-wrap" id="chart-container"></div>
   </div>
 
   <!-- Positions -->
@@ -331,6 +362,144 @@ async function refresh() {
 
 refresh();
 setInterval(refresh, 5000);
+
+// --- Chart ---
+let chart = null;
+let candleSeries = null;
+let ema20Series = null;
+let ema50Series = null;
+let ema200Series = null;
+let levelLines = [];
+let tradeMarkers = [];
+let activeSymbol = 'ES';
+let activeTf = '5m';
+const SYMBOLS = ['ES', 'NQ', 'CL', 'GC', 'SI'];
+
+function initChart() {
+  const container = document.getElementById('chart-container');
+  if (!container || typeof LightweightCharts === 'undefined') return;
+
+  chart = LightweightCharts.createChart(container, {
+    width: container.clientWidth,
+    height: container.clientHeight,
+    layout: { background: { color: '#0d1117' }, textColor: '#8b949e', fontSize: 11, fontFamily: "'JetBrains Mono', monospace" },
+    grid: { vertLines: { color: '#1c2128' }, horzLines: { color: '#1c2128' } },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor: '#30363d' },
+    timeScale: { borderColor: '#30363d', timeVisible: true, secondsVisible: false },
+  });
+
+  candleSeries = chart.addCandlestickSeries({
+    upColor: '#3fb950', downColor: '#f85149', borderUpColor: '#3fb950', borderDownColor: '#f85149',
+    wickUpColor: '#3fb950', wickDownColor: '#f85149',
+  });
+
+  ema20Series = chart.addLineSeries({ color: '#d29922', lineWidth: 1, title: 'EMA 20', priceLineVisible: false });
+  ema50Series = chart.addLineSeries({ color: '#58a6ff', lineWidth: 1, title: 'EMA 50', priceLineVisible: false });
+  ema200Series = chart.addLineSeries({ color: '#8b949e', lineWidth: 1, title: 'EMA 200', priceLineVisible: false });
+
+  // Resize
+  const ro = new ResizeObserver(() => { if (chart) chart.applyOptions({ width: container.clientWidth }); });
+  ro.observe(container);
+
+  // Symbol buttons
+  const btnDiv = document.getElementById('chart-btns');
+  SYMBOLS.forEach(s => {
+    const btn = document.createElement('button');
+    btn.className = 'chart-btn' + (s === activeSymbol ? ' active' : '');
+    btn.textContent = s;
+    btn.onclick = () => { activeSymbol = s; updateChartBtns(); loadChart(); };
+    btnDiv.appendChild(btn);
+  });
+
+  // TF buttons
+  document.querySelectorAll('.tf-btn').forEach(btn => {
+    btn.onclick = () => {
+      activeTf = btn.dataset.tf;
+      document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      loadChart();
+    };
+  });
+
+  loadChart();
+  setInterval(loadChart, 30000);
+}
+
+function updateChartBtns() {
+  document.querySelectorAll('.chart-btn').forEach(b => {
+    b.classList.toggle('active', b.textContent === activeSymbol);
+  });
+}
+
+async function loadChart() {
+  if (!chart || !candleSeries) return;
+
+  const hours = activeTf === '1h' ? 72 : activeTf === '15m' ? 48 : 24;
+  const data = await api(`/api/candles?symbol=${activeSymbol}&tf=${activeTf}&hours=${hours}`);
+  if (!data || !data.candles || !data.candles.length) return;
+
+  candleSeries.setData(data.candles);
+  ema20Series.setData(data.ema20 || []);
+  ema50Series.setData(data.ema50 || []);
+  ema200Series.setData(data.ema200 || []);
+
+  // Remove old level lines
+  levelLines.forEach(l => candleSeries.removePriceLine(l));
+  levelLines = [];
+
+  // Add PDH/PDL/PDC lines
+  const lvl = await api('/api/levels');
+  if (lvl && lvl.instruments) {
+    const inst = lvl.instruments.find(i => i.symbol === activeSymbol);
+    if (inst) {
+      if (inst.pdh) levelLines.push(candleSeries.createPriceLine({ price: inst.pdh, color: '#3fb950', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'PDH' }));
+      if (inst.pdl) levelLines.push(candleSeries.createPriceLine({ price: inst.pdl, color: '#f85149', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'PDL' }));
+      if (inst.pdc) levelLines.push(candleSeries.createPriceLine({ price: inst.pdc, color: '#d29922', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'PDC' }));
+    }
+  }
+
+  // Trade markers from session trades
+  const tr = await api('/api/trades');
+  if (tr && tr.trades) {
+    const markers = [];
+    const symTrades = tr.trades.filter(t => t.symbol === activeSymbol && t.price);
+    for (const t of symTrades) {
+      // Find nearest candle time for this trade
+      const last = data.candles[data.candles.length - 1];
+      if (!last) continue;
+      // Use last candle as approximate time (we don't have exact timestamps from log)
+      // For open/closed trades, mark at a reasonable position
+      if (t.status === 'open' || t.status === 'closed') {
+        // Entry marker
+        markers.push({
+          time: last.time - (symTrades.indexOf(t) * 300), // spread markers
+          position: t.side === 'BUY' ? 'belowBar' : 'aboveBar',
+          color: t.side === 'BUY' ? '#3fb950' : '#f85149',
+          shape: t.side === 'BUY' ? 'arrowUp' : 'arrowDown',
+          text: `${t.side} @ ${fmt(t.price)}`,
+        });
+      }
+    }
+    // Sort by time
+    markers.sort((a, b) => a.time - b.time);
+    candleSeries.setMarkers(markers);
+  }
+
+  // Fit visible range to last 8 hours for 5m
+  const visibleBars = activeTf === '1m' ? 120 : activeTf === '5m' ? 96 : activeTf === '15m' ? 64 : 48;
+  const from = Math.max(0, data.candles.length - visibleBars);
+  if (data.candles.length > visibleBars) {
+    chart.timeScale().setVisibleLogicalRange({ from: from, to: data.candles.length });
+  }
+}
+
+// Init chart after DOM ready
+if (typeof LightweightCharts !== 'undefined') {
+  initChart();
+} else {
+  window.addEventListener('load', initChart);
+}
 </script>
 </body>
 </html>
