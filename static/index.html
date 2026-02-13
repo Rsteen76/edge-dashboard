@@ -623,7 +623,15 @@ function handleRealtimePayload(payload, parentType = '') {
     payload.pnl != null ||
     payload.unrealizedPnl != null
   );
-  if (hasPriceLikeFields) applyInstrumentsUpdate(payload);
+  if (hasPriceLikeFields) {
+    applyInstrumentsUpdate(payload);
+    // Update chart current candle with latest price
+    const symbol = normalizeSymbol(payload.symbol ?? payload.instrument);
+    const price = num(payload.last ?? payload.lastPrice ?? payload.price ?? payload.close);
+    if (symbol && price != null) {
+      updateCurrentCandle(symbol, price);
+    }
+  }
 
   if (payload.levels && Array.isArray(payload.levels.instruments)) {
     applyInstrumentsUpdate(payload.levels.instruments, { replace: true });
@@ -768,13 +776,30 @@ function initChart() {
   });
 
   loadChart({ forceFit: true });
-  setInterval(() => loadChart(), 60000);
 }
 
 function updateChartBtns() {
   document.querySelectorAll('.chart-btn').forEach(b => {
     b.classList.toggle('active', b.textContent === activeSymbol);
   });
+}
+
+function updateCurrentCandle(symbol, price) {
+  if (!chart || !candleSeries || symbol !== activeSymbol) return;
+  if (!price || !Number.isFinite(price)) return;
+
+  // Get current candle data
+  const data = candleSeries.data();
+  if (!data || !data.length) return;
+
+  // Clone the last candle and update it
+  const lastCandle = { ...data[data.length - 1] };
+  lastCandle.close = price;
+  if (price > lastCandle.high) lastCandle.high = price;
+  if (price < lastCandle.low) lastCandle.low = price;
+
+  // Update the candle
+  candleSeries.update(lastCandle);
 }
 
 async function loadChart({ forceFit = false } = {}) {
