@@ -846,7 +846,10 @@ async function loadChart({ forceFit = false } = {}) {
 
   // Add swing point markers (triangles at swing highs/lows)
   const swingMarkers = [];
-  if (swingResp && Array.isArray(swingResp.swingPoints)) {
+  if (swingResp && Array.isArray(swingResp.swingPoints) && candles.length > 0) {
+    // Build a lookup of candle times for matching
+    const candleTimes = candles.map(c => c.time);
+    
     for (const swingPoint of swingResp.swingPoints) {
       const price = Number(swingPoint.price);
       if (!Number.isFinite(price)) continue;
@@ -859,6 +862,17 @@ async function loadChart({ forceFit = false } = {}) {
       if (!Number.isFinite(timestampMs) || timestampMs <= 0) continue;
       const swingTime = Math.floor(timestampMs / 1000);
 
+      // Find nearest candle time (markers must match exact candle timestamps)
+      let nearestTime = candleTimes[0];
+      let minDiff = Math.abs(swingTime - nearestTime);
+      for (const candleTime of candleTimes) {
+        const diff = Math.abs(swingTime - candleTime);
+        if (diff < minDiff) {
+          minDiff = diff;
+          nearestTime = candleTime;
+        }
+      }
+
       const timeframe = String(swingPoint.timeframe || '').toUpperCase();
       
       // Different colors for 5m vs 15m swings
@@ -870,7 +884,7 @@ async function loadChart({ forceFit = false } = {}) {
       }
       
       swingMarkers.push({
-        time: swingTime,
+        time: nearestTime,
         position: type === 'high' ? 'aboveBar' : 'belowBar',
         color,
         shape: type === 'high' ? 'arrowDown' : 'arrowUp',
