@@ -846,9 +846,9 @@ async function loadChart({ forceFit = false } = {}) {
 
   // Add swing point markers (triangles at swing highs/lows)
   const swingMarkers = [];
-  if (swingResp && Array.isArray(swingResp.swingPoints) && candles.length > 0) {
+  if (swingResp && Array.isArray(swingResp.swingPoints) && data.candles.length > 0) {
     // Build a lookup of candle times for matching
-    const candleTimes = candles.map(c => c.time);
+    const candleTimes = data.candles.map(c => c.time);
     
     for (const swingPoint of swingResp.swingPoints) {
       const price = Number(swingPoint.price);
