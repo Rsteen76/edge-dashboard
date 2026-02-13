@@ -823,11 +823,10 @@ async function loadChart({ forceFit = false } = {}) {
     previousChartKey = chartKey;
   }
 
-  const [lvl, swingResp, orderResp, tr] = await Promise.all([
+  const [lvl, swingResp, orderResp] = await Promise.all([
     api('/api/levels'),
     api(`/api/swing-points?symbol=${symbol}`),
     api('/api/orders'),
-    api('/api/trades'),
   ]);
   if (chartLoadId !== latestChartLoadId || symbol !== activeSymbol || tf !== activeTf) return;
 
