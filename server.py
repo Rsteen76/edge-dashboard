@@ -5,9 +5,7 @@ Proxies NT8 bridge data and parses trader logs for a live trading view.
 """
 
 import asyncio
-import math
 import re
-import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
@@ -23,9 +21,6 @@ WIN_HOST = "100.66.60.10"
 SSH_TARGET = f"ryans@{WIN_HOST}"
 BRIDGE = f"http://{WIN_HOST}:8080"
 LOG_FILE = r"C:\Users\ryans\clawd\agents\trader\futures\trader-error.log"
-DB_REMOTE = "C:/Users/ryans/clawd/agents/trader/futures/futures_trades.db"
-DB_LOCAL = "/tmp/futures_trades.db"
-DB_SYNC_INTERVAL = 300  # 5 minutes
 CACHE_TTL = 5
 
 # --- Cache ---
@@ -44,41 +39,12 @@ def _set(key: str, val: object):
     return val
 
 
-_db_last_sync: float = 0
-
-
-async def sync_db():
-    """SCP the trader DB from Windows. Non-blocking."""
-    global _db_last_sync
-    if time.time() - _db_last_sync < DB_SYNC_INTERVAL:
-        return
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "scp", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
-            f"{SSH_TARGET}:{DB_REMOTE}", DB_LOCAL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.wait_for(proc.communicate(), timeout=30)
-        _db_last_sync = time.time()
-    except Exception:
-        pass  # Use stale cache
-
-
-def get_db() -> sqlite3.Connection | None:
-    """Open local copy of trader DB."""
-    try:
-        return sqlite3.connect(f"file:{DB_LOCAL}?mode=ro", uri=True)
-    except Exception:
-        return None
-
-
 def calc_ema(closes: list[float], period: int) -> list[float | None]:
     """Calculate EMA for a list of closes. Returns same-length list."""
     if len(closes) < period:
         return [None] * len(closes)
     k = 2 / (period + 1)
     ema = [None] * (period - 1)
-    # Seed with SMA
     ema.append(sum(closes[:period]) / period)
     for i in range(period, len(closes)):
         ema.append(closes[i] * k + ema[-1] * (1 - k))
@@ -86,34 +52,6 @@ def calc_ema(closes: list[float], period: int) -> list[float | None]:
 
 
 TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
-
-
-def aggregate_candles(rows: list, tf_secs: int) -> list[dict]:
-    """Aggregate 15s candle rows into larger timeframe.
-    rows: [(timestamp, open, high, low, close, volume), ...]
-    """
-    if not rows:
-        return []
-    buckets: dict[int, list] = {}
-    for ts, o, h, l, c, v in rows:
-        bucket = (ts // tf_secs) * tf_secs
-        if bucket not in buckets:
-            buckets[bucket] = []
-        buckets[bucket].append((ts, o, h, l, c, v))
-
-    candles = []
-    for bucket in sorted(buckets):
-        bars = buckets[bucket]
-        bars.sort(key=lambda x: x[0])
-        candles.append({
-            "time": bucket,
-            "open": bars[0][1],
-            "high": max(b[2] for b in bars),
-            "low": min(b[3] for b in bars),
-            "close": bars[-1][4],
-            "volume": sum(b[5] for b in bars),
-        })
-    return candles
 
 
 def strip_prefix(line: str) -> str:
@@ -468,28 +406,20 @@ async def candles(
     tf: str = Query("5m"),
     hours: int = Query(24),
 ):
-    """Aggregated candles with EMA overlays from trader DB."""
-    await sync_db()
-    db = get_db()
-    if not db:
-        return {"error": "DB not available", "candles": [], "ema20": [], "ema50": [], "ema200": []}
-
+    """Real-time candles from bridge with EMA overlays."""
     tf_secs = TF_SECONDS.get(tf, 300)
-    cutoff = int(time.time()) - (hours * 3600)
+    cache_key = f"candles:{symbol}:{tf}:{hours}"
+    cached = _cached(cache_key)
+    if cached:
+        return cached
 
-    try:
-        rows = db.execute(
-            "SELECT timestamp, open, high, low, close, volume FROM candles_15s "
-            "WHERE symbol = ? AND timestamp >= ? ORDER BY timestamp",
-            (symbol, cutoff),
-        ).fetchall()
-        db.close()
-    except Exception:
-        return {"error": "DB query failed", "candles": [], "ema20": [], "ema50": [], "ema200": []}
-
-    agg = aggregate_candles(rows, tf_secs)
-    if not agg:
+    data = await bridge_get(f"/candles?symbol={symbol}&tf={tf_secs}&hours={hours}")
+    if not data or "candles" not in data:
         return {"candles": [], "ema20": [], "ema50": [], "ema200": []}
+
+    agg = data["candles"]
+    if not agg:
+        return _set(cache_key, {"candles": [], "ema20": [], "ema50": [], "ema200": []})
 
     closes = [c["close"] for c in agg]
     ema20_vals = calc_ema(closes, 20)
@@ -500,37 +430,20 @@ async def candles(
     ema50 = [{"time": agg[i]["time"], "value": round(v, 4)} for i, v in enumerate(ema50_vals) if v is not None]
     ema200 = [{"time": agg[i]["time"], "value": round(v, 4)} for i, v in enumerate(ema200_vals) if v is not None]
 
-    return {"candles": agg, "ema20": ema20, "ema50": ema50, "ema200": ema200}
+    return _set(cache_key, {"candles": agg, "ema20": ema20, "ema50": ema50, "ema200": ema200})
 
 
-@app.get("/api/chart-trades")
-async def chart_trades(symbol: str = Query("ES")):
-    """Trades for a specific symbol from the DB."""
-    await sync_db()
-    db = get_db()
-    if not db:
-        return {"trades": []}
-
-    try:
-        rows = db.execute(
-            "SELECT trade_id, direction, entry_price, entry_time, exit_price, exit_time, "
-            "stop, target, r_multiple, pnl_dollars, status, session, setup_type "
-            "FROM futures_trades WHERE symbol = ? ORDER BY entry_time DESC LIMIT 20",
-            (symbol,),
-        ).fetchall()
-        db.close()
-    except Exception:
-        return {"trades": []}
-
-    cols = ["trade_id", "direction", "entry_price", "entry_time", "exit_price", "exit_time",
-            "stop", "target", "r_multiple", "pnl_dollars", "status", "session", "setup_type"]
-    return {"trades": [dict(zip(cols, r)) for r in rows]}
-
-
-@app.on_event("startup")
-async def startup_sync():
-    """Sync DB on startup."""
-    await sync_db()
+@app.get("/api/swing-points")
+async def swing_points(symbol: str = Query(None)):
+    """Swing points from bridge (persisted by trader)."""
+    cached = _cached(f"swings:{symbol}")
+    if cached:
+        return cached
+    url = "/swing-points"
+    if symbol:
+        url += f"?symbol={symbol}"
+    data = await bridge_get(url)
+    return _set(f"swings:{symbol}", data or {"swingPoints": []})
 
 
 # --- Static files ---
