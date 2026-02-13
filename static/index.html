@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LSR Trading Dashboard</title>
+<style>
+:root {
+  --bg: #0d1117; --card: #161b22; --border: #30363d;
+  --text: #e6edf3; --dim: #8b949e; --green: #3fb950; --red: #f85149;
+  --blue: #58a6ff; --yellow: #d29922; --font: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family:var(--font); font-size:13px; padding:12px; }
+h1 { font-size:18px; font-weight:600; }
+h2 { font-size:14px; font-weight:600; color:var(--dim); text-transform:uppercase; letter-spacing:1px; margin-bottom:8px; }
+
+/* Layout */
+.dashboard { display:grid; grid-template-columns:1fr 1fr; gap:12px; max-width:1400px; margin:0 auto; }
+.full { grid-column: 1 / -1; }
+.card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:16px; }
+
+/* Header */
+.header { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:12px; }
+.header-left { display:flex; align-items:center; gap:16px; }
+.header h1 { color:var(--blue); }
+.status-badge { padding:3px 10px; border-radius:12px; font-size:11px; font-weight:700; text-transform:uppercase; }
+.status-running { background:rgba(63,185,80,0.15); color:var(--green); }
+.status-stopped { background:rgba(248,81,73,0.15); color:var(--red); }
+.status-unknown { background:rgba(139,148,158,0.15); color:var(--dim); }
+.stats { display:flex; gap:24px; flex-wrap:wrap; }
+.stat-item { text-align:right; }
+.stat-label { font-size:10px; color:var(--dim); text-transform:uppercase; }
+.stat-value { font-size:20px; font-weight:700; }
+.stat-value.positive { color:var(--green); }
+.stat-value.negative { color:var(--red); }
+
+/* Instrument cards */
+.instruments { display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:8px; }
+.inst-card { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:12px; }
+.inst-sym { font-size:16px; font-weight:700; color:var(--blue); margin-bottom:2px; }
+.inst-price { font-size:22px; font-weight:700; color:var(--text); margin-bottom:8px; letter-spacing:-0.5px; }
+.inst-row { display:flex; justify-content:space-between; margin:2px 0; }
+.inst-label { color:var(--dim); font-size:11px; }
+.inst-val { font-weight:600; }
+.pdh { color:var(--green); }
+.pdl { color:var(--red); }
+.pdc { color:var(--yellow); }
+
+/* Tables */
+table { width:100%; border-collapse:collapse; font-size:12px; }
+th { text-align:left; color:var(--dim); font-size:10px; text-transform:uppercase; padding:6px 8px; border-bottom:1px solid var(--border); }
+td { padding:6px 8px; border-bottom:1px solid var(--border); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:400px; }
+tr:hover { background:rgba(88,166,255,0.05); }
+
+/* Positions */
+.pos-long { color:var(--green); }
+.pos-short { color:var(--red); }
+.pos-flat { color:var(--dim); }
+
+/* Signal feed */
+.signal-feed { max-height:300px; overflow-y:auto; font-size:11px; line-height:1.6; }
+.signal-line { padding:2px 0; border-bottom:1px solid rgba(48,54,61,0.5); word-break:break-all; }
+
+/* Footer */
+.footer { text-align:center; color:var(--dim); font-size:10px; padding:8px; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width:6px; }
+::-webkit-scrollbar-track { background:var(--bg); }
+::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+
+@media (max-width:768px) {
+  body { padding:6px; font-size:12px; }
+  .dashboard { grid-template-columns:1fr; gap:8px; }
+  .header { flex-direction:column; align-items:flex-start; padding:12px; }
+  .header h1 { font-size:16px; }
+  .stats { gap:8px; width:100%; justify-content:space-between; }
+  .stat-item { text-align:center; flex:1; }
+  .stat-value { font-size:16px; }
+  .stat-label { font-size:9px; }
+  .card { padding:10px; }
+  h2 { font-size:12px; margin-bottom:6px; }
+  .instruments { grid-template-columns:repeat(2, 1fr); gap:6px; }
+  .inst-card { padding:8px; }
+  .inst-sym { font-size:14px; margin-bottom:4px; }
+  .inst-label { font-size:10px; }
+  .inst-val { font-size:11px; }
+  table { font-size:11px; }
+  th, td { padding:4px 5px; }
+  .signal-feed { max-height:200px; font-size:10px; }
+  .signal-line { word-break:break-word; }
+  /* Trade table: hide verbose columns on mobile */
+  .trade-table-wrap { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  .hide-mobile { display:none; }
+  /* Stack positions and trades */
+  .pos-card, .trade-card { grid-column:1/-1; }
+}
+</style>
+</head>
+<body>
+
+<div class="header card full" style="grid-column:1/-1;">
+  <div class="header-left">
+    <h1>⚡ LSR Dashboard</h1>
+    <span id="status-badge" class="status-badge status-unknown">—</span>
+  </div>
+  <div class="stats">
+    <div class="stat-item"><div class="stat-label">Balance</div><div class="stat-value" id="balance">—</div></div>
+    <div class="stat-item"><div class="stat-label">Unrealized P&L</div><div class="stat-value" id="pnl">—</div></div>
+    <div class="stat-item"><div class="stat-label">Positions</div><div class="stat-value" id="pos-count">0</div></div>
+    <div class="stat-item"><div class="stat-label">Updated</div><div class="stat-value" id="updated" style="font-size:11px;color:var(--dim)">—</div></div>
+  </div>
+</div>
+
+<div class="dashboard">
+  <!-- Levels -->
+  <div class="card full">
+    <h2>📊 Instrument Levels (PDH / PDL / PDC)</h2>
+    <div class="instruments" id="instruments">
+      <div style="color:var(--dim)">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Positions -->
+  <div class="card">
+    <h2>📍 Open Positions</h2>
+    <div class="trade-table-wrap"><table>
+      <thead><tr><th>Symbol</th><th>Qty</th><th>Avg Price</th><th>P&L</th></tr></thead>
+      <tbody id="positions-body"><tr><td colspan="4" style="color:var(--dim)">Loading…</td></tr></tbody>
+    </table></div>
+  </div>
+
+  <!-- Trades -->
+  <div class="card">
+    <h2>📋 Trade Log</h2>
+    <div class="trade-table-wrap" style="max-height:300px;overflow-y:auto;">
+      <table>
+        <thead><tr><th>Symbol</th><th>Result</th><th>Detail</th><th class="hide-mobile">R</th><th class="hide-mobile">Status</th><th>P&L</th></tr></thead>
+        <tbody id="trades-body"><tr><td style="color:var(--dim)">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Signal Feed -->
+  <div class="card full">
+    <h2>📡 Signal Feed</h2>
+    <div class="signal-feed" id="signal-feed">
+      <div style="color:var(--dim)">Loading…</div>
+    </div>
+  </div>
+</div>
+
+<div class="footer">LSR Trading Dashboard • Auto-refresh 5s</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const api = path => fetch(path).then(r => r.json()).catch(() => null);
+
+function fmt(n) {
+  if (n == null) return '—';
+  return Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+}
+
+async function refresh() {
+  // Status
+  const st = await api('/api/status');
+  if (st && st.status) {
+    const b = $('#status-badge');
+    b.textContent = st.status.toUpperCase();
+    b.className = 'status-badge status-' + st.status;
+  }
+
+  // Account
+  const acc = await api('/api/account');
+  if (acc && !acc.error) {
+    const bal = acc.CashValue ?? acc.cashValue ?? acc.balance ?? acc.NetLiquidation ?? acc.netLiquidation;
+    const pnl = acc.UnrealizedPnL ?? acc.unrealizedPnl ?? acc.pnl ?? 0;
+    $('#balance').textContent = '$' + fmt(bal);
+    const pnlEl = $('#pnl');
+    pnlEl.textContent = (pnl >= 0 ? '+$' : '-$') + fmt(Math.abs(pnl));
+    pnlEl.className = 'stat-value ' + (pnl >= 0 ? 'positive' : 'negative');
+  }
+
+  // Positions
+  const posRaw = await api('/api/positions');
+  const pos = posRaw && posRaw.positions ? posRaw.positions : (Array.isArray(posRaw) ? posRaw : []);
+  const tbody = $('#positions-body');
+  if (pos.length > 0) {
+    $('#pos-count').textContent = pos.length;
+    tbody.innerHTML = pos.map(p => {
+      const qty = p.Quantity ?? p.quantity ?? 0;
+      const cls = qty > 0 ? 'pos-long' : qty < 0 ? 'pos-short' : 'pos-flat';
+      return `<tr>
+        <td>${p.Instrument ?? p.instrument ?? p.symbol ?? '—'}</td>
+        <td class="${cls}">${qty}</td>
+        <td>${fmt(p.AveragePrice ?? p.averagePrice ?? p.avgPrice)}</td>
+        <td class="${(p.UnrealizedPnL ?? p.unrealizedPnl ?? 0) >= 0 ? 'pos-long' : 'pos-short'}">${fmt(p.UnrealizedPnL ?? p.unrealizedPnl)}</td>
+      </tr>`;
+    }).join('');
+  } else {
+    $('#pos-count').textContent = '0';
+    tbody.innerHTML = '<tr><td colspan="4" style="color:var(--dim)">No open positions</td></tr>';
+  }
+
+  // Levels
+  const lvl = await api('/api/levels');
+  const instDiv = $('#instruments');
+  if (lvl && lvl.instruments && lvl.instruments.length) {
+    instDiv.innerHTML = lvl.instruments.map(i => {
+      const price = i.last != null ? fmt(i.last) : '—';
+      // Color price based on position relative to PDC
+      let priceColor = 'var(--text)';
+      if (i.last != null && i.pdc != null) {
+        priceColor = i.last > i.pdc ? 'var(--green)' : i.last < i.pdc ? 'var(--red)' : 'var(--text)';
+      }
+      return `
+      <div class="inst-card">
+        <div class="inst-sym">${i.symbol}</div>
+        <div class="inst-price" style="color:${priceColor}">${price}</div>
+        <div class="inst-row"><span class="inst-label">PDH</span><span class="inst-val pdh">${fmt(i.pdh)}</span></div>
+        <div class="inst-row"><span class="inst-label">PDL</span><span class="inst-val pdl">${fmt(i.pdl)}</span></div>
+        <div class="inst-row"><span class="inst-label">PDC</span><span class="inst-val pdc">${fmt(i.pdc)}</span></div>
+      </div>`;
+    }).join('');
+  } else {
+    instDiv.innerHTML = '<div style="color:var(--dim)">No level data yet</div>';
+  }
+
+  // Trades
+  const tr = await api('/api/trades');
+  const tBody = $('#trades-body');
+  if (tr && tr.trades && tr.trades.length) {
+    tBody.innerHTML = tr.trades.map(t => {
+      if (t.type === 'cancel') return `<tr><td colspan="6" style="color:var(--dim)">❌ ${t.symbol} — expired</td></tr>`;
+
+      if (t.type === 'exit') {
+        const c = t.pnl >= 0 ? 'var(--green)' : 'var(--red)';
+        const icon = t.pnl >= 0 ? '✅' : '❌';
+        return `<tr>
+          <td style="font-weight:700">${t.symbol}</td>
+          <td style="color:${c}">${icon} ${t.result.toUpperCase()}</td>
+          <td>${t.ticks > 0 ? '+' : ''}${t.ticks} ticks</td>
+          <td class="hide-mobile">${t.r > 0 ? '+' : ''}${t.r.toFixed(2)}R</td>
+          <td class="hide-mobile">${t.result}</td>
+          <td style="color:${c};font-weight:700">${t.pnl >= 0 ? '+' : ''}$${fmt(Math.abs(t.pnl))}</td>
+        </tr>`;
+      }
+
+      if (t.type === 'open') {
+        const sideColor = t.side === 'BUY' ? 'var(--green)' : 'var(--red)';
+        const pnlColor = (t.pnl||0) >= 0 ? 'var(--green)' : 'var(--red)';
+        return `<tr>
+          <td style="font-weight:700">${t.symbol}</td>
+          <td style="color:${sideColor}">${t.side}</td>
+          <td>${fmt(t.price)}</td>
+          <td class="hide-mobile">${t.stop ? fmt(t.stop) + ' / ' + fmt(t.target) : '—'}</td>
+          <td class="hide-mobile"><span style="color:var(--blue)">● OPEN</span></td>
+          <td style="color:${pnlColor};font-weight:700">${(t.pnl||0) >= 0 ? '+' : ''}$${fmt(Math.abs(t.pnl||0))}</td>
+        </tr>`;
+      }
+
+      return '';
+    }).join('');
+  } else {
+    tBody.innerHTML = '<tr><td colspan="6" style="color:var(--dim)">No trades today</td></tr>';
+  }
+
+  // Signals
+  const sig = await api('/api/signals');
+  const feed = $('#signal-feed');
+  if (sig && sig.signals && sig.signals.length) {
+    feed.innerHTML = sig.signals.map(s => {
+      let cls = '';
+      if (/FILLED|LONG|BUY/i.test(s)) cls = 'color:var(--green)';
+      else if (/SL|STOP|EXIT|SHORT|SELL/i.test(s)) cls = 'color:var(--red)';
+      else if (/LSR|SCAN|SIGNAL/i.test(s)) cls = 'color:var(--blue)';
+      return `<div class="signal-line" style="${cls}">${s}</div>`;
+    }).join('');
+  } else {
+    feed.innerHTML = '<div style="color:var(--dim)">No signals</div>';
+  }
+
+  $('#updated').textContent = new Date().toLocaleTimeString();
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
