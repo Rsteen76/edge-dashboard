@@ -902,31 +902,8 @@ async function loadChart({ forceFit = false } = {}) {
     }
   }
 
-  // Trade markers from session trades
-  if (tr && tr.trades) {
-    const markers = [];
-    const symTrades = tr.trades.filter(t => t.symbol === symbol && t.price);
-    for (const t of symTrades) {
-      // Find nearest candle time for this trade
-      const last = data.candles[data.candles.length - 1];
-      if (!last) continue;
-      // Use last candle as approximate time (we don't have exact timestamps from log)
-      // For open/closed trades, mark at a reasonable position
-      if (t.status === 'open' || t.status === 'closed') {
-        // Entry marker
-        markers.push({
-          time: last.time - (symTrades.indexOf(t) * 300), // spread markers
-          position: t.side === 'BUY' ? 'belowBar' : 'aboveBar',
-          color: t.side === 'BUY' ? '#3fb950' : '#f85149',
-          shape: t.side === 'BUY' ? 'arrowUp' : 'arrowDown',
-          text: `${t.side} @ ${fmt(t.price)}`,
-        });
-      }
-    }
-    // Sort by time
-    markers.sort((a, b) => a.time - b.time);
-    candleSeries.setMarkers(markers);
-  }
+  // Clear any old markers
+  candleSeries.setMarkers([]);
 
 }
 
