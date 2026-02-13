@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""LSR Trading Dashboard — FastAPI backend."""
+"""LSR Trading Dashboard — FastAPI backend.
+
+Proxies NT8 bridge data and parses trader logs for a live trading view.
+"""
 
 import asyncio
 import re
@@ -10,7 +13,6 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 
 app = FastAPI(title="LSR Dashboard")
 
@@ -18,8 +20,7 @@ app = FastAPI(title="LSR Dashboard")
 WIN_HOST = "100.66.60.10"
 SSH_TARGET = f"ryans@{WIN_HOST}"
 BRIDGE = f"http://{WIN_HOST}:8080"
-LOG_DIR = r"C:\Users\ryans\clawd\agents\trader\futures"
-LOG_FILE = f"{LOG_DIR}\\trader-error.log"  # All output goes here
+LOG_FILE = r"C:\Users\ryans\clawd\agents\trader\futures\trader-error.log"
 CACHE_TTL = 5
 
 # --- Cache ---
@@ -38,23 +39,14 @@ def _set(key: str, val: object):
     return val
 
 
-async def ssh_read(remote_path: str, tail: int | None = None) -> str:
-    cmd = f"type \"{remote_path}\""
-    if tail:
-        cmd = f"powershell -Command \"Get-Content '{remote_path}' -Tail {tail}\""
-    proc = await asyncio.create_subprocess_exec(
-        "ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
-        SSH_TARGET, cmd,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-    return stdout.decode("utf-8", errors="replace")
+def strip_prefix(line: str) -> str:
+    """Remove INFO:module: log prefixes."""
+    return re.sub(r"^(INFO|WARNING|ERROR|DEBUG):\S+:", "", line).strip()
 
 
-async def ssh_grep(remote_path: str, pattern: str, last: int = 30) -> str:
-    """Use Select-String on Windows for efficient log searching."""
+async def ssh_grep(pattern: str, last: int = 30) -> str:
     cmd = (
-        f"powershell -Command \"Select-String -Path '{remote_path}' "
+        f"powershell -Command \"Select-String -Path '{LOG_FILE}' "
         f"-Pattern '{pattern}' | Select-Object -Last {last} | "
         f"ForEach-Object {{ $_.Line }}\""
     )
@@ -84,19 +76,9 @@ async def status():
     cached = _cached("status")
     if cached:
         return cached
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ssh", "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no",
-            SSH_TARGET,
-            'powershell -Command "Get-Process -Name NinjaTrader* -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { $_.ProcessName }"',
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=8)
-        running = bool(stdout.strip())
-        result = {"status": "running" if running else "stopped", "ts": datetime.utcnow().isoformat()}
-    except Exception:
-        result = {"status": "unknown", "ts": datetime.utcnow().isoformat()}
-    return _set("status", result)
+    bridge = await bridge_get("/status")
+    ok = bridge is not None
+    return _set("status", {"status": "running" if ok else "offline", "bridge": ok, "ts": datetime.utcnow().isoformat()})
 
 
 @app.get("/api/account")
@@ -105,9 +87,7 @@ async def account():
     if cached:
         return cached
     data = await bridge_get("/account")
-    if data is None:
-        return {"error": "bridge unreachable"}
-    return _set("account", data)
+    return _set("account", data or {"error": "bridge unreachable"})
 
 
 @app.get("/api/positions")
@@ -115,10 +95,41 @@ async def positions():
     cached = _cached("positions")
     if cached:
         return cached
-    data = await bridge_get("/positions")
-    if data is None:
-        return {"error": "bridge unreachable"}
-    return _set("positions", data)
+    pos = await bridge_get("/positions")
+    orders = await bridge_get("/orders")
+
+    pos_list = []
+    if pos and "positions" in pos:
+        order_list = orders.get("orders", []) if orders else []
+        for p in pos["positions"]:
+            sym = p.get("symbol", "")
+            sl = tp = None
+            for o in order_list:
+                if o.get("symbol") != sym or o.get("state") != "Working":
+                    continue
+                if o.get("orderType") == "StopMarket":
+                    sl = o.get("price")
+                elif o.get("orderType") == "Limit":
+                    tp = o.get("price")
+            pos_list.append({
+                "symbol": sym,
+                "direction": p.get("direction", ""),
+                "quantity": p.get("quantity", 0),
+                "avgPrice": p.get("avgPrice", 0),
+                "unrealizedPnl": p.get("unrealizedPnl", 0),
+                "sl": sl,
+                "tp": tp,
+            })
+    return _set("positions", {"positions": pos_list})
+
+
+@app.get("/api/orders")
+async def orders():
+    cached = _cached("orders")
+    if cached:
+        return cached
+    data = await bridge_get("/orders")
+    return _set("orders", data or {"error": "bridge unreachable"})
 
 
 @app.get("/api/quotes")
@@ -127,9 +138,7 @@ async def quotes():
     if cached:
         return cached
     data = await bridge_get("/quotes")
-    if data is None:
-        return _set("quotes", {})
-    return _set("quotes", data)
+    return _set("quotes", data or {})
 
 
 @app.get("/api/levels")
@@ -138,8 +147,7 @@ async def levels():
     if cached:
         return cached
     try:
-        # Format: "NQ LSR SCAN: PDH=$25360.5 PDL=$25100.0 PDC=$25278.8"
-        text = await ssh_grep(LOG_FILE, "LSR SCAN:", last=50)
+        text = await ssh_grep("LSR SCAN:", last=50)
     except Exception:
         return _set("levels", {"instruments": []})
 
@@ -158,7 +166,6 @@ async def levels():
                 "pdc": float(m.group(4)),
             }
 
-    # Merge live quotes
     quote_data = await bridge_get("/quotes")
     if quote_data:
         for inst in instruments.values():
@@ -171,123 +178,164 @@ async def levels():
     return _set("levels", {"instruments": list(instruments.values())})
 
 
-TICK_VALUES = {
-    "ES": (0.25, 12.50), "NQ": (0.25, 5.00), "CL": (0.01, 10.00),
-    "GC": (0.10, 10.00), "SI": (0.005, 25.00),
-}
-
-
 @app.get("/api/trades")
 async def trades():
+    """Session-scoped trades: only from latest trader restart."""
     cached = _cached("trades")
     if cached:
         return cached
 
-    # Get real P&L from "Trade logged" lines
     try:
-        exit_text = await ssh_grep(LOG_FILE, "Trade logged", last=50)
+        text = await ssh_grep(
+            "Startup levels|PLACING LIMIT|Expected R:R|Trade logged|Canceling LIMIT|FILLED",
+            last=250,
+        )
     except Exception:
-        exit_text = ""
+        text = ""
 
-    # Parse exits: "✅ [NQ] Trade logged (NT8 executed): +142.0 ticks | $+1775.00 | +14.20R"
+    lines = text.splitlines()
+
+    # Find last "Startup levels" — everything after is current session
+    session_start = 0
+    for i, line in enumerate(lines):
+        if "Startup levels" in line:
+            session_start = i
+    session_lines = lines[session_start:]
+
+    # Patterns
+    place_pat = re.compile(
+        r"\[(\w+)\]\s+PLACING LIMIT ORDER:\s+(BUY|SELL)\s+\w+\s+@\s+([\d.]+)"
+    )
+    detail_pat = re.compile(
+        r"Expected R:R:\s+([\d.]+)R\s*\|\s*Setup:\s+(\S+)\s*\|\s*Session:\s+(\S+)\s*\|\s*Time:\s+([\d:]+)\s+PT"
+    )
     exit_pat = re.compile(
         r"\[(\w+)\]\s+Trade logged.*?([+-]?[\d.]+)\s*ticks\s*\|\s*\$([+-]?[\d.]+)\s*\|\s*([+-]?[\d.]+)R"
     )
+    cancel_pat = re.compile(r"\[(\w+)\]\s+Canceling LIMIT order")
+
+    entries = []
     exits = []
-    for line in exit_text.splitlines():
+    cancelled_syms = set()
+    current_entry = None
+
+    for line in session_lines:
+        m = place_pat.search(line)
+        if m:
+            current_entry = {
+                "symbol": m.group(1),
+                "side": m.group(2),
+                "price": float(m.group(3)),
+            }
+            entries.append(current_entry)
+            continue
+
+        m = detail_pat.search(line)
+        if m and current_entry:
+            current_entry["rr"] = float(m.group(1))
+            current_entry["setup"] = m.group(2)
+            current_entry["session"] = m.group(3)
+            current_entry["time"] = m.group(4)
+            current_entry = None
+            continue
+
         m = exit_pat.search(line)
         if m:
-            pnl_dollars = float(m.group(3))
+            pnl = float(m.group(3))
             exits.append({
                 "symbol": m.group(1),
                 "ticks": float(m.group(2)),
-                "pnl": pnl_dollars,
+                "pnl": pnl,
                 "r": float(m.group(4)),
-                "result": "win" if pnl_dollars > 0 else "loss",
+                "result": "win" if pnl > 0 else "loss",
             })
+            continue
 
-    # Get entries for context
-    try:
-        entry_text = await ssh_grep(
-            LOG_FILE,
-            "PLACING LIMIT|Current Price|Canceling LIMIT",
-            last=60,
-        )
-    except Exception:
-        entry_text = ""
+        m = cancel_pat.search(line)
+        if m:
+            cancelled_syms.add(m.group(1))
 
-    # Get open positions
+    # Live state from bridge
     pos_data = await bridge_get("/positions")
     pos_map = {}
     if pos_data and "positions" in pos_data:
         for p in pos_data["positions"]:
             pos_map[p.get("symbol", "")] = p
 
-    place_pat = re.compile(
-        r"\[(\w+)\]\s+PLACING LIMIT ORDER:\s+(BUY|SELL)\s+\w+\s+@\s+([\d.]+)"
-    )
-    detail_pat = re.compile(
-        r"Current Price:\s+([\d.]+)\s*\|\s*Entry:\s+([\d.]+)\s*\|\s*Stop:\s+([\d.]+)\s*\|\s*Target:\s+([\d.]+)"
-    )
-    cancel_pat = re.compile(r"\[(\w+)\]\s+Canceling LIMIT order.*expired")
-
-    entries = []
-    for line in entry_text.splitlines():
-        m = place_pat.search(line)
-        if m:
-            entries.append({
-                "symbol": m.group(1),
-                "side": m.group(2),
-                "price": float(m.group(3)),
-            })
-            continue
-        m = detail_pat.search(line)
-        if m and entries and "stop" not in entries[-1]:
-            entries[-1]["stop"] = float(m.group(3))
-            entries[-1]["target"] = float(m.group(4))
-            continue
-        m = cancel_pat.search(line)
-        if m:
-            entries.append({"type": "cancel", "symbol": m.group(1), "reason": "expired"})
-
-    # Tag open entries
-    for e in entries:
-        if e.get("type") == "cancel":
-            continue
-        sym = e.get("symbol", "")
-        pos = pos_map.get(sym)
-        if pos and abs(pos.get("avgPrice", 0) - e.get("price", 0)) < 1:
-            e["status"] = "open"
-            e["pnl"] = pos.get("unrealizedPnl", 0)
-
-    # Build final trade list: real exits first, then recent entries
+    # Build trade list — each entry becomes a trade record
     trade_list = []
+    exit_pool = list(exits)  # copy for consumption
 
-    for ex in exits[-20:]:
+    for e in entries:
+        sym = e["symbol"]
+        pos = pos_map.get(sym)
+
+        trade = {
+            "symbol": sym,
+            "side": e["side"],
+            "price": e["price"],
+            "rr": e.get("rr"),
+            "setup": e.get("setup"),
+            "session": e.get("session"),
+            "time": e.get("time"),
+        }
+
+        # Is this the currently open position? Match direction too.
+        direction_match = (
+            pos and (
+                (e["side"] == "BUY" and pos.get("direction") == "Long") or
+                (e["side"] == "SELL" and pos.get("direction") == "Short")
+            )
+        )
+        if direction_match and abs(pos.get("avgPrice", 0) - e["price"]) < 2:
+            trade["status"] = "open"
+            trade["pnl"] = pos.get("unrealizedPnl", 0)
+            trade["direction"] = pos.get("direction", "")
+        else:
+            # Check for matching exit (consume first match)
+            matched = False
+            for j, x in enumerate(exit_pool):
+                if x["symbol"] == sym:
+                    trade["status"] = "closed"
+                    trade["pnl"] = x["pnl"]
+                    trade["ticks"] = x["ticks"]
+                    trade["r_actual"] = x["r"]
+                    trade["result"] = x["result"]
+                    exit_pool.pop(j)
+                    matched = True
+                    break
+            if not matched:
+                trade["status"] = "cancelled" if sym in cancelled_syms else "pending"
+
+        trade_list.append(trade)
+
+    # Any unmatched exits (edge case)
+    for x in exit_pool:
         trade_list.append({
-            "type": "exit",
-            "symbol": ex["symbol"],
-            "ticks": ex["ticks"],
-            "pnl": ex["pnl"],
-            "r": ex["r"],
-            "result": ex["result"],
+            "symbol": x["symbol"],
+            "status": "closed",
+            "pnl": x["pnl"],
+            "ticks": x["ticks"],
+            "r_actual": x["r"],
+            "result": x["result"],
         })
 
-    for e in entries[-15:]:
-        if e.get("type") == "cancel":
-            trade_list.append(e)
-        elif e.get("status") == "open":
-            trade_list.append({
-                "type": "open",
-                "symbol": e["symbol"],
-                "side": e["side"],
-                "price": e["price"],
-                "stop": e.get("stop"),
-                "target": e.get("target"),
-                "pnl": e.get("pnl", 0),
-            })
+    # Summary
+    closed = [t for t in trade_list if t.get("status") == "closed"]
+    wins = sum(1 for t in closed if t.get("result") == "win")
+    losses = len(closed) - wins
+    total_pnl = sum(t.get("pnl", 0) for t in closed)
 
-    return _set("trades", {"trades": trade_list})
+    return _set("trades", {
+        "trades": trade_list,
+        "summary": {
+            "total": len(closed),
+            "wins": wins,
+            "losses": losses,
+            "winRate": round(wins / len(closed) * 100, 1) if closed else 0,
+            "pnl": total_pnl,
+        },
+    })
 
 
 @app.get("/api/signals")
@@ -296,22 +344,45 @@ async def signals():
     if cached:
         return cached
     try:
-        # Get meaningful signals: sweeps, entries, rejections, cancels — not candle loading spam
         text = await ssh_grep(
-            LOG_FILE,
-            "SWEEP|PLACING|RECLAIM|ENTRY|ORDER|Cancel|expired|SIGNAL|reject|LSR SCAN|fill",
-            last=30,
+            "SWEEP|PLACING|RECLAIM|FILLED|Cancel|expired|reject|Trade logged|PENDING|ORDER placed|ORDER|Startup",
+            last=40,
         )
     except Exception:
         return _set("signals", {"signals": []})
 
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    # Deduplicate consecutive identical lines
-    deduped = []
+    # Find session boundary
+    raw_lines = text.splitlines()
+    session_start = 0
+    for i, line in enumerate(raw_lines):
+        if "Startup levels" in line:
+            session_start = i
+
+    lines = raw_lines[session_start:]
+
+    # Clean and filter
+    cleaned = []
     for line in lines:
-        if not deduped or line != deduped[-1]:
-            deduped.append(line)
-    return _set("signals", {"signals": deduped[-30:]})
+        line = strip_prefix(line).strip()
+        if not line:
+            continue
+        # Skip noise
+        if "LSR SCAN:" in line:
+            continue
+        if line.startswith("Placing order:") or line.startswith("{"):
+            continue
+        if "Order will fill when price returns" in line:
+            continue
+        if "Order placed: {" in line or "Order canceled: {" in line:
+            continue
+        if line.startswith("Canceling order None"):
+            continue
+        if "LIMIT order placed, waiting for fill" in line:
+            continue
+        if not cleaned or line != cleaned[-1]:
+            cleaned.append(line)
+
+    return _set("signals", {"signals": cleaned[-30:]})
 
 
 # --- Static files ---
