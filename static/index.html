@@ -844,10 +844,9 @@ async function loadChart({ forceFit = false } = {}) {
     }
   }
 
-  // Add swing point lines (as line series starting from swing timestamp)
-  if (swingResp && Array.isArray(swingResp.swingPoints) && candles.length > 0) {
-    const latestTime = candles[candles.length - 1].time;
-    
+  // Add swing point markers (triangles at swing highs/lows)
+  const swingMarkers = [];
+  if (swingResp && Array.isArray(swingResp.swingPoints)) {
     for (const swingPoint of swingResp.swingPoints) {
       const price = Number(swingPoint.price);
       if (!Number.isFinite(price)) continue;
@@ -870,23 +869,18 @@ async function loadChart({ forceFit = false } = {}) {
         color = type === 'high' ? '#f85149' : '#a371f7';  // 15m: red high, purple low
       }
       
-      // Create a line series for this swing that starts from swing time
-      const swingLine = chart.addLineSeries({
+      swingMarkers.push({
+        time: swingTime,
+        position: type === 'high' ? 'aboveBar' : 'belowBar',
         color,
-        lineWidth: 1,
-        lineStyle: LightweightCharts.LineStyle.Dashed,
-        priceLineVisible: false,
-        lastValueVisible: false,
-        crosshairMarkerVisible: false,
+        shape: type === 'high' ? 'arrowDown' : 'arrowUp',
+        text: `${timeframe} ${type.toUpperCase()}`,
+        size: 1
       });
-      
-      // Draw line from swing time to current time
-      swingLine.setData([
-        { time: swingTime, value: price },
-        { time: latestTime, value: price }
-      ]);
-      
-      levelLines.push(swingLine);
+    }
+    
+    if (swingMarkers.length > 0) {
+      candleSeries.setMarkers(swingMarkers);
     }
   }
 
