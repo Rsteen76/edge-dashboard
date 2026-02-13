@@ -11,8 +11,9 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, WebSocket
 from fastapi.staticfiles import StaticFiles
+import websockets
 
 app = FastAPI(title="LSR Dashboard")
 
@@ -444,6 +445,34 @@ async def swing_points(symbol: str = Query(None)):
         url += f"?symbol={symbol}"
     data = await bridge_get(url)
     return _set(f"swings:{symbol}", data or {"swingPoints": []})
+
+
+@app.websocket("/api/ws")
+async def websocket_proxy(websocket: WebSocket):
+    """WebSocket proxy to NT8 bridge (for HTTPS compatibility)."""
+    await websocket.accept()
+    bridge_ws_url = f"ws://{WIN_HOST}:9998"
+    
+    try:
+        async with websockets.connect(bridge_ws_url) as bridge_ws:
+            async def forward_to_client():
+                async for msg in bridge_ws:
+                    await websocket.send_text(msg)
+            
+            async def forward_to_bridge():
+                while True:
+                    data = await websocket.receive_text()
+                    await bridge_ws.send(data)
+            
+            await asyncio.gather(
+                forward_to_client(),
+                forward_to_bridge(),
+                return_exceptions=True
+            )
+    except Exception:
+        pass
+    finally:
+        await websocket.close()
 
 
 # --- Static files ---

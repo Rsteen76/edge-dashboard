@@ -190,7 +190,7 @@ const fmt = n => n == null ? '—' : Number(n).toLocaleString('en-US', {minimumF
 const pnlStr = n => (n >= 0 ? '+$' : '-$') + fmt(Math.abs(n));
 const pnlCls = n => n >= 0 ? 'pos' : 'neg';
 const pnlColor = n => n >= 0 ? 'var(--green)' : 'var(--red)';
-const WS_URL = 'ws://100.66.60.10:9998';
+const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/ws`;
 const realtimeState = {
   status: null,
   account: null,
