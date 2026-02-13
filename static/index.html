@@ -443,6 +443,7 @@ async function loadChart() {
   ema20Series.setData(data.ema20 || []);
   ema50Series.setData(data.ema50 || []);
   ema200Series.setData(data.ema200 || []);
+  chart.timeScale().fitContent();
 
   // Remove old level lines
   levelLines.forEach(l => candleSeries.removePriceLine(l));
@@ -456,6 +457,59 @@ async function loadChart() {
       if (inst.pdh) levelLines.push(candleSeries.createPriceLine({ price: inst.pdh, color: '#3fb950', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'PDH' }));
       if (inst.pdl) levelLines.push(candleSeries.createPriceLine({ price: inst.pdl, color: '#f85149', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'PDL' }));
       if (inst.pdc) levelLines.push(candleSeries.createPriceLine({ price: inst.pdc, color: '#d29922', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'PDC' }));
+    }
+  }
+
+  // Add swing point lines
+  const swingResp = await api(`/api/swing-points?symbol=${activeSymbol}`);
+  if (swingResp && Array.isArray(swingResp.swingPoints)) {
+    for (const swingPoint of swingResp.swingPoints) {
+      const price = Number(swingPoint.price);
+      if (!Number.isFinite(price)) continue;
+
+      const type = String(swingPoint.type || '').toLowerCase();
+      if (type !== 'high' && type !== 'low') continue;
+
+      const timeframe = String(swingPoint.timeframe || '').toUpperCase();
+      const title = `${timeframe} ${type.toUpperCase()}`.trim();
+      levelLines.push(candleSeries.createPriceLine({
+        price,
+        color: type === 'high' ? '#db6d28' : '#58a6ff',
+        lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed,
+        axisLabelVisible: true,
+        title,
+      }));
+    }
+  }
+
+  // Add pending working limit order lines
+  const orderResp = await api('/api/orders');
+  if (orderResp && orderResp.orders) {
+    const pendingLimitOrders = orderResp.orders.filter(o =>
+      o &&
+      o.symbol === activeSymbol &&
+      String(o.state || '').toLowerCase() === 'working' &&
+      String(o.orderType || '').toLowerCase() === 'limit'
+    );
+
+    for (const order of pendingLimitOrders) {
+      const orderPrice = Number(order.price);
+      if (!Number.isFinite(orderPrice)) continue;
+
+      const action = String(order.action || '').toUpperCase();
+      const isBuy = action.includes('BUY');
+      const isSell = action.includes('SELL');
+      if (!isBuy && !isSell) continue;
+
+      levelLines.push(candleSeries.createPriceLine({
+        price: orderPrice,
+        color: isBuy ? '#3fb950' : '#f85149',
+        lineWidth: 2,
+        lineStyle: LightweightCharts.LineStyle.Solid,
+        axisLabelVisible: true,
+        title: `${isBuy ? 'BUY' : 'SELL'} LIMIT @ ${fmt(orderPrice)}`,
+      }));
     }
   }
 
@@ -486,12 +540,6 @@ async function loadChart() {
     candleSeries.setMarkers(markers);
   }
 
-  // Fit visible range to last 8 hours for 5m
-  const visibleBars = activeTf === '1m' ? 120 : activeTf === '5m' ? 96 : activeTf === '15m' ? 64 : 48;
-  const from = Math.max(0, data.candles.length - visibleBars);
-  if (data.candles.length > visibleBars) {
-    chart.timeScale().setVisibleLogicalRange({ from: from, to: data.candles.length });
-  }
 }
 
 // Init chart after DOM ready
