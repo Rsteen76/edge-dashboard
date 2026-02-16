@@ -476,7 +476,38 @@ async def websocket_proxy(websocket: WebSocket):
 
 
 # --- Static files ---
-app.mount("/", StaticFiles(directory=str(Path(__file__).parent / "static"), html=True), name="static")
+# Serve static files without catching API routes
+from fastapi.responses import FileResponse, HTMLResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+@app.exception_handler(404)
+async def custom_404_handler(request, exc):
+    """Serve static files for non-API routes when no API endpoint matches."""
+    path = request.url.path
+    
+    # Never intercept /api/* routes - return 404 as-is
+    if path.startswith("/api/"):
+        raise exc
+    
+    # Serve static files
+    if path == "/":
+        index_file = STATIC_DIR / "index.html"
+        if index_file.exists():
+            return HTMLResponse(index_file.read_text())
+    else:
+        # Remove leading slash for file lookup
+        file_path = STATIC_DIR / path.lstrip("/")
+        if file_path.exists() and file_path.is_file():
+            return FileResponse(file_path)
+    
+    # If no static file found, try index.html (SPA fallback)
+    index_file = STATIC_DIR / "index.html"
+    if index_file.exists():
+        return HTMLResponse(index_file.read_text())
+    
+    raise exc
 
 if __name__ == "__main__":
     import uvicorn

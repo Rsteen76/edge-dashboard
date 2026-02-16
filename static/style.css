@@ -1,11 +1,3 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LSR Trading Dashboard</title>
-<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
-<style>
 :root {
   --bg: #0d1117; --card: #161b22; --border: #30363d;
   --text: #e6edf3; --dim: #8b949e; --green: #3fb950; --red: #f85149;
@@ -40,7 +32,9 @@ h2 { font-size:13px; font-weight:600; color:var(--dim); text-transform:uppercase
 
 /* Instrument cards */
 .instruments { display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:8px; }
-.inst { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:12px; }
+.inst { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:12px; cursor:pointer; transition:border-color 0.2s, background 0.2s; }
+.inst:hover { border-color:var(--blue); background:rgba(88,166,255,0.05); }
+.inst.selected { border-color:var(--blue); background:rgba(88,166,255,0.1); }
 .inst-sym { font-size:16px; font-weight:700; color:var(--blue); margin-bottom:2px; }
 .inst-price { font-size:22px; font-weight:700; margin-bottom:8px; letter-spacing:-0.5px; }
 .inst-row { display:flex; justify-content:space-between; margin:2px 0; }
@@ -118,71 +112,3 @@ h2 { font-size:13px; font-weight:600; color:var(--dim); text-transform:uppercase
 .tf-btn { background:var(--bg); border:1px solid var(--border); color:var(--dim); padding:3px 8px;
   border-radius:3px; cursor:pointer; font-family:var(--font); font-size:10px; }
 .tf-btn.active { color:var(--blue); border-color:var(--blue); }
-</style>
-</head>
-<body>
-
-<!-- Header -->
-<div class="card full header" style="margin-bottom:12px;">
-  <div class="header-left">
-    <h1>⚡ LSR Dashboard</h1>
-    <span id="badge" class="badge badge-unknown">—</span>
-  </div>
-  <div class="stats">
-    <div class="stat"><div class="stat-label">Balance</div><div class="stat-val" id="balance">—</div></div>
-    <div class="stat"><div class="stat-label">Realized</div><div class="stat-val" id="realized">—</div></div>
-    <div class="stat"><div class="stat-label">Unrealized</div><div class="stat-val" id="unrealized">—</div></div>
-    <div class="stat"><div class="stat-label">Positions</div><div class="stat-val" id="posCount">0</div></div>
-    <div class="stat"><div class="stat-label">Updated</div><div class="stat-val dim" id="updated">—</div></div>
-  </div>
-</div>
-
-<div class="dashboard">
-  <!-- Instruments -->
-  <div class="card full">
-    <h2>📊 Instruments</h2>
-    <div class="instruments" id="instruments"><div style="color:var(--dim)">Loading…</div></div>
-  </div>
-
-  <!-- Chart -->
-  <div class="card full">
-    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-      <h2 style="margin:0;">📈 Chart</h2>
-      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
-        <div class="chart-btns" id="chart-btns"></div>
-        <div class="tf-btns">
-          <button class="tf-btn" data-tf="1m">1m</button>
-          <button class="tf-btn active" data-tf="5m">5m</button>
-          <button class="tf-btn" data-tf="15m">15m</button>
-          <button class="tf-btn" data-tf="1h">1h</button>
-        </div>
-      </div>
-    </div>
-    <div class="chart-wrap" id="chart-container"></div>
-  </div>
-
-  <!-- Positions -->
-  <div class="card">
-    <h2>📍 Open Positions</h2>
-    <div id="positions"><div style="color:var(--dim)">Loading…</div></div>
-  </div>
-
-  <!-- Session Trades -->
-  <div class="card">
-    <h2>📋 Session Trades</h2>
-    <div class="summary-bar" id="summary"></div>
-    <div id="trades" style="max-height:320px;overflow-y:auto;"><div style="color:var(--dim)">Loading…</div></div>
-  </div>
-
-  <!-- Signal Feed -->
-  <div class="card full">
-    <h2>📡 Activity Feed</h2>
-    <div class="signal-feed" id="signals"><div style="color:var(--dim)">Loading…</div></div>
-  </div>
-</div>
-
-<div class="footer">LSR Trading Dashboard • Real-time WS • Chart 60s</div>
-
-<script src="app.js"></script>
-</body>
-</html>

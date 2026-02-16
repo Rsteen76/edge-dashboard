@@ -1,1 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
 venv/
+.env
+*.sqlite
+*.db
+.DS_Store
+*.backup*
+FINDINGS.md
+FIX-SUMMARY.md
