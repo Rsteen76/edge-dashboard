@@ -40,7 +40,9 @@ h2 { font-size:13px; font-weight:600; color:var(--dim); text-transform:uppercase
 
 /* Instrument cards */
 .instruments { display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:8px; }
-.inst { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:12px; }
+.inst { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:12px; cursor:pointer; transition:border-color 0.15s, background 0.15s; }
+.inst:hover { border-color:var(--blue); }
+.inst.selected { border-color:var(--blue); background:rgba(88,166,255,0.05); }
 .inst-sym { font-size:16px; font-weight:700; color:var(--blue); margin-bottom:2px; }
 .inst-price { font-size:22px; font-weight:700; margin-bottom:8px; letter-spacing:-0.5px; }
 .inst-row { display:flex; justify-content:space-between; margin:2px 0; }

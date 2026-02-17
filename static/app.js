@@ -1,285 +1,306 @@
-// LSR Trading Dashboard - Fixed
+// ============================================================
+// LSR Trading Dashboard — Real-time Frontend
+// ============================================================
 
-// Helpers
-const $ = (s) => document.querySelector(s);
-const $$ = (s) => document.querySelectorAll(s);
-const api = async (p, timeoutMs = 10000) => {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+// --- Utilities ---
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+const fmt = n => n == null ? '—' : Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtInt = n => n == null ? '—' : Number(n).toLocaleString('en-US');
+
+async function api(path, timeoutMs = 10000) {
+  const ctrl = new AbortController();
+  const tid = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const r = await fetch(p, { signal: controller.signal });
-    if (!r.ok) return null;
-    return await r.json();
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeoutId);
-  }
-};
-const fmt = (n) => n == null ? '—' : Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const fmtInt = (n) => n == null ? '—' : Number(n).toLocaleString('en-US');
+    const r = await fetch(path, { signal: ctrl.signal });
+    return r.ok ? await r.json() : null;
+  } catch { return null; }
+  finally { clearTimeout(tid); }
+}
 
-// State (expose to window for debugging)
-window.chart = null;
-window.candleSeries = null;
-window.ema20Series = null;
-window.ema50Series = null;
-window.ema200Series = null;
+// --- Config ---
+const SYMBOLS = ['ES', 'NQ', 'CL', 'GC', 'SI'];
+const FAST_POLL_MS = 3000;
+const SLOW_POLL_MS = 15000;
+const CHART_POLL_MS = 10000;
+
+// --- State ---
+let activeSymbol = 'ES';
+let activeTf = '5m';
+
+// Chart
 let chart = null;
 let candleSeries = null;
 let ema20Series = null;
 let ema50Series = null;
 let ema200Series = null;
-let activeSymbol = 'ES';
-let activeTf = '5m';
-const SYMBOLS = ['ES', 'NQ', 'CL', 'GC', 'SI'];
-let ws = null;
-let wsReconnectTimer = null;
-let wsReconnectAttempts = 0;
-let chartInitRetries = 0;
-let fastDataInFlight = false;
-let pendingFastRefresh = false;
-let fastRefreshTimer = null;
-let lastFastRefreshAt = 0;
-let slowDataInFlight = false;
-let pendingSlowRefresh = false;
-let slowRefreshTimer = null;
-let lastSlowRefreshAt = 0;
-let latestLevels = [];
-let latestQuotes = {};
-let chartRequestToken = 0;
-const MIN_FAST_REFRESH_INTERVAL_MS = 400;
-const MIN_SLOW_REFRESH_INTERVAL_MS = 3000;
+let chartReqId = 0;
+let lastCandle = null;
 
-// Initialize on DOM ready
+// Data
+let quotes = {};
+let levels = [];
+
+// WebSocket
+let ws = null;
+let wsTimer = null;
+let wsAttempts = 0;
+let wsMessageCount = 0;
+
+// ======================== ENTRY POINT ========================
+
 document.addEventListener('DOMContentLoaded', () => {
-  console.log('DOM loaded, initializing dashboard...');
   initChart();
-  loadFastData();
-  loadSlowData();
-  loadSwingPoints();
-  initWebSocket();
-  // Fallback polling cadence for steady updates when WS stalls.
-  setInterval(() => scheduleFastRefresh(150), 3000);
-  setInterval(() => scheduleSlowRefresh(500), 15000);
+  connectWS();
+
+  // Initial full data load
+  pollFast();
+  pollSlow();
+
+  // Periodic REST reconciliation
+  setInterval(pollFast, FAST_POLL_MS);
+  setInterval(pollSlow, SLOW_POLL_MS);
+  setInterval(loadChart, CHART_POLL_MS);
 });
 
-// Chart initialization
-function initChart() {
-  const container = $('#chart-container');
-  if (!container) {
-    console.error('Chart container not found');
-    return;
-  }
-  
-  if (typeof LightweightCharts === 'undefined') {
-    console.error('LightweightCharts library not loaded');
-    if (chartInitRetries < 20) {
-      chartInitRetries += 1;
-      setTimeout(initChart, 500); // Retry
-    }
-    return;
-  }
-  chartInitRetries = 0;
+// ======================== CHART ========================
 
-  console.log('Creating chart...');
-  chart = window.chart = LightweightCharts.createChart(container, {
-    width: container.clientWidth,
+function initChart() {
+  const el = $('#chart-container');
+  if (!el) return;
+  if (typeof LightweightCharts === 'undefined') {
+    setTimeout(initChart, 500);
+    return;
+  }
+
+  chart = window.chart = LightweightCharts.createChart(el, {
+    width: el.clientWidth,
     height: 450,
     layout: {
       background: { color: '#0d1117' },
       textColor: '#8b949e',
       fontSize: 11,
-      fontFamily: "'JetBrains Mono', monospace"
+      fontFamily: "'JetBrains Mono', monospace",
     },
     grid: {
       vertLines: { color: '#1c2128' },
-      horzLines: { color: '#1c2128' }
+      horzLines: { color: '#1c2128' },
     },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
     rightPriceScale: { borderColor: '#30363d' },
-    timeScale: { borderColor: '#30363d', timeVisible: true, secondsVisible: false }
+    timeScale: { borderColor: '#30363d', timeVisible: true, secondsVisible: false },
   });
 
-  candleSeries = window.candleSeries = chart.addCandlestickSeries({
-    upColor: '#3fb950',
-    downColor: '#f85149',
-    borderUpColor: '#3fb950',
-    borderDownColor: '#f85149',
-    wickUpColor: '#3fb950',
-    wickDownColor: '#f85149'
+  candleSeries = chart.addCandlestickSeries({
+    upColor: '#3fb950', downColor: '#f85149',
+    borderUpColor: '#3fb950', borderDownColor: '#f85149',
+    wickUpColor: '#3fb950', wickDownColor: '#f85149',
   });
+  ema20Series = chart.addLineSeries({ color: '#d29922', lineWidth: 1, priceLineVisible: false });
+  ema50Series = chart.addLineSeries({ color: '#58a6ff', lineWidth: 1, priceLineVisible: false });
+  ema200Series = chart.addLineSeries({ color: '#8b949e', lineWidth: 1, priceLineVisible: false });
 
-  ema20Series = window.ema20Series = chart.addLineSeries({ color: '#d29922', lineWidth: 1, priceLineVisible: false });
-  ema50Series = window.ema50Series = chart.addLineSeries({ color: '#58a6ff', lineWidth: 1, priceLineVisible: false });
-  ema200Series = window.ema200Series = chart.addLineSeries({ color: '#8b949e', lineWidth: 1, priceLineVisible: false });
-
-  // Resize observer
-  new ResizeObserver(() => {
-    if (chart) chart.applyOptions({ width: container.clientWidth });
-  }).observe(container);
+  new ResizeObserver(() => chart?.applyOptions({ width: el.clientWidth })).observe(el);
 
   // Symbol buttons
-  const btnDiv = $('#chart-btns');
+  const btns = $('#chart-btns');
   SYMBOLS.forEach(sym => {
-    const btn = document.createElement('button');
-    btn.className = 'chart-btn' + (sym === activeSymbol ? ' active' : '');
-    btn.textContent = sym;
-    btn.onclick = () => {
-      activeSymbol = sym;
-      $$('.chart-btn').forEach(b => b.classList.toggle('active', b.textContent === sym));
-      $$('.inst').forEach(i => i.classList.toggle('selected', i.dataset.symbol === activeSymbol));
-      loadChart();
-      loadSwingPoints();
-    };
-    btnDiv.appendChild(btn);
+    const b = document.createElement('button');
+    b.className = 'chart-btn' + (sym === activeSymbol ? ' active' : '');
+    b.textContent = sym;
+    b.onclick = () => switchSymbol(sym);
+    btns.appendChild(b);
   });
 
   // Timeframe buttons
-  $$('.tf-btn').forEach(btn => {
-    btn.onclick = () => {
-      activeTf = btn.dataset.tf;
-      $$('.tf-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
+  $$('.tf-btn').forEach(b => {
+    b.onclick = () => {
+      activeTf = b.dataset.tf;
+      $$('.tf-btn').forEach(x => x.classList.remove('active'));
+      b.classList.add('active');
       loadChart();
     };
   });
 
-  console.log('Chart initialized successfully');
   loadChart();
 }
 
-// Load chart data
 async function loadChart() {
   if (!chart || !candleSeries) return;
-  const requestToken = ++chartRequestToken;
-  const symbol = activeSymbol;
+  const id = ++chartReqId;
+  const sym = activeSymbol;
   const tf = activeTf;
-  const hours = activeTf === '1h' ? 72 : activeTf === '15m' ? 48 : 24;
-  const data = await api(`/api/candles?symbol=${symbol}&tf=${tf}&hours=${hours}`);
+  const hours = tf === '1h' ? 72 : tf === '15m' ? 48 : 24;
+  const data = await api(`/api/candles?symbol=${sym}&tf=${tf}&hours=${hours}`);
 
-  if (requestToken !== chartRequestToken) return;
-  if (!data || !data.candles) {
-    console.error('No chart data received');
-    return;
-  }
+  // Discard if user switched symbol/tf while we were loading
+  if (id !== chartReqId) return;
+  if (!data?.candles?.length) return;
 
-  console.log(`Loaded ${data.candles.length} candles for ${symbol} ${tf}`);
   candleSeries.setData(data.candles);
   ema20Series.setData(data.ema20 || []);
   ema50Series.setData(data.ema50 || []);
   ema200Series.setData(data.ema200 || []);
-  
   chart.timeScale().fitContent();
+
+  // Store last candle for live-tick updates between full refreshes
+  lastCandle = { ...data.candles[data.candles.length - 1] };
 }
 
-function updateStatus(status) {
-  if (!status) return;
-  const badge = $('#badge');
-  if (!badge) return;
-  const state = status.status || 'offline';
-  badge.textContent = state.toUpperCase();
-  if (state === 'running') {
-    badge.className = 'badge badge-running';
-  } else if (state === 'degraded') {
-    badge.className = 'badge badge-unknown';
-  } else {
-    badge.className = 'badge badge-offline';
-  }
+function tickChart(price) {
+  if (!candleSeries || !lastCandle || price == null) return;
+  lastCandle.high = Math.max(lastCandle.high ?? price, price);
+  lastCandle.low = Math.min(lastCandle.low ?? price, price);
+  lastCandle.close = price;
+  candleSeries.update(lastCandle);
 }
 
-function updateAccount(account) {
-  if (!account) return;
-  $('#balance').textContent = '$' + fmtInt(account.balance || 0);
-  $('#realized').textContent = fmt(account.realizedPnl || 0);
-  $('#realized').className = 'stat-val ' + (account.realizedPnl > 0 ? 'pos' : account.realizedPnl < 0 ? 'neg' : '');
-  $('#unrealized').textContent = fmt(account.unrealizedPnl || 0);
-  $('#unrealized').className = 'stat-val ' + (account.unrealizedPnl > 0 ? 'pos' : account.unrealizedPnl < 0 ? 'neg' : '');
-  $('#updated').textContent = new Date().toLocaleTimeString();
+function switchSymbol(sym) {
+  if (sym === activeSymbol) return;
+  activeSymbol = sym;
+  $$('.inst').forEach(i => i.classList.toggle('selected', i.dataset.symbol === sym));
+  $$('.chart-btn').forEach(b => b.classList.toggle('active', b.textContent === sym));
+  lastCandle = null;
+  loadChart();
+  loadSwingPoints();
 }
 
-function normalizeQuotes(quotesPayload) {
-  if (!quotesPayload) return {};
-  if (quotesPayload.quotes && Array.isArray(quotesPayload.quotes)) {
-    return quotesPayload.quotes.reduce((acc, row) => {
-      if (row && row.symbol) acc[row.symbol] = row;
-      return acc;
-    }, {});
-  }
-  if (Array.isArray(quotesPayload)) {
-    return quotesPayload.reduce((acc, row) => {
-      if (row && row.symbol) acc[row.symbol] = row;
-      return acc;
-    }, {});
-  }
-  return quotesPayload;
+// ======================== DATA LOADING ========================
+
+async function pollFast() {
+  try {
+    const [status, account, positions, quotesData] = await Promise.all([
+      api('/api/status'),
+      api('/api/account'),
+      api('/api/positions'),
+      api('/api/quotes'),
+    ]);
+    renderStatus(status);
+    renderAccount(account);
+    renderPositions(positions);
+    if (quotesData?.quotes && typeof quotesData.quotes === 'object') {
+      Object.assign(quotes, quotesData.quotes);
+      updateQuotePrices();
+    }
+  } catch (e) { console.error('pollFast:', e); }
 }
 
-function renderInstruments() {
-  const container = $('#instruments');
-  if (!container) return;
-  const source = latestLevels.length > 0
-    ? latestLevels
-    : SYMBOLS.map(sym => ({ symbol: sym }));
-  container.innerHTML = source.map(inst => {
-    const quote = latestQuotes[inst.symbol] || {};
-    const price = quote.last ?? inst.last ?? null;
+async function pollSlow() {
+  try {
+    const [levelsData, trades, signals] = await Promise.all([
+      api('/api/levels', 12000),
+      api('/api/trades', 12000),
+      api('/api/signals', 12000),
+    ]);
+    if (levelsData?.instruments) {
+      levels = levelsData.instruments;
+      rebuildInstruments();
+    }
+    renderTrades(trades);
+    renderSignals(signals);
+    loadSwingPoints();
+  } catch (e) { console.error('pollSlow:', e); }
+}
+
+async function loadSwingPoints() {
+  const data = await api(`/api/swing-points?symbol=${activeSymbol}`, 8000);
+  renderSwingPoints(data);
+}
+
+// ======================== RENDER FUNCTIONS ========================
+
+function renderStatus(d) {
+  if (!d) return;
+  const el = $('#badge');
+  if (!el) return;
+  const s = d.status || 'offline';
+  el.textContent = s.toUpperCase();
+  el.className = 'badge ' + (s === 'running' ? 'badge-running' : s === 'degraded' ? 'badge-unknown' : 'badge-offline');
+}
+
+function renderAccount(d) {
+  if (!d || d.error) return;
+  const set = (id, val) => { const e = $(id); if (e) e.textContent = val; };
+  const cls = (id, c) => { const e = $(id); if (e) e.className = 'stat-val ' + c; };
+  set('#balance', '$' + fmtInt(d.balance || 0));
+  set('#realized', fmt(d.realizedPnl || 0));
+  cls('#realized', d.realizedPnl > 0 ? 'pos' : d.realizedPnl < 0 ? 'neg' : '');
+  set('#unrealized', fmt(d.unrealizedPnl || 0));
+  cls('#unrealized', d.unrealizedPnl > 0 ? 'pos' : d.unrealizedPnl < 0 ? 'neg' : '');
+  set('#updated', new Date().toLocaleTimeString());
+}
+
+function rebuildInstruments() {
+  const el = $('#instruments');
+  if (!el) return;
+  const src = levels.length > 0 ? levels : SYMBOLS.map(s => ({ symbol: s }));
+  el.innerHTML = src.map(inst => {
+    const q = quotes[inst.symbol] || {};
     return `
       <div class="inst ${inst.symbol === activeSymbol ? 'selected' : ''}" data-symbol="${inst.symbol}">
         <div class="inst-sym">${inst.symbol}</div>
-        <div class="inst-price">${fmt(price)}</div>
-        <div class="inst-row"><span class="inst-label">Bid</span><span class="inst-val">${fmt(quote.bid ?? inst.bid)}</span></div>
-        <div class="inst-row"><span class="inst-label">Ask</span><span class="inst-val">${fmt(quote.ask ?? inst.ask)}</span></div>
+        <div class="inst-price" data-q="last">${fmt(q.last ?? inst.last)}</div>
+        <div class="inst-row"><span class="inst-label">Bid</span><span class="inst-val" data-q="bid">${fmt(q.bid ?? inst.bid)}</span></div>
+        <div class="inst-row"><span class="inst-label">Ask</span><span class="inst-val" data-q="ask">${fmt(q.ask ?? inst.ask)}</span></div>
         <div class="inst-row"><span class="inst-label pdh">PDH</span><span class="inst-val">${fmt(inst.pdh)}</span></div>
         <div class="inst-row"><span class="inst-label pdl">PDL</span><span class="inst-val">${fmt(inst.pdl)}</span></div>
         <div class="inst-row"><span class="inst-label pdc">PDC</span><span class="inst-val">${fmt(inst.pdc)}</span></div>
-      </div>
-    `;
+      </div>`;
   }).join('');
-
-  $$('.inst').forEach(el => {
-    el.onclick = () => {
-      activeSymbol = el.dataset.symbol;
-      $$('.inst').forEach(i => i.classList.toggle('selected', i.dataset.symbol === activeSymbol));
-      $$('.chart-btn').forEach(b => b.classList.toggle('active', b.textContent === activeSymbol));
-      loadChart();
-      loadSwingPoints();
-    };
-  });
+  $$('.inst').forEach(card => { card.onclick = () => switchSymbol(card.dataset.symbol); });
 }
 
-function updatePositions(positions) {
-  if (positions && positions.positions && positions.positions.length > 0) {
-    $('#posCount').textContent = positions.positions.length;
-    $('#positions').innerHTML = positions.positions.map(p => `
-      <div class="pos-row">
-        <div class="pos-info">
-          <span class="pos-sym">${p.symbol}</span>
-          <span class="pos-dir pos-${(p.direction || '').toLowerCase()}">${(p.direction || '').toUpperCase()}</span>
-          <div class="pos-detail">
-            Entry ${fmt(p.avgPrice)} · SL ${fmt(p.sl)} · TP ${fmt(p.tp)}
-          </div>
-        </div>
-        <div class="pos-pnl ${p.unrealizedPnl > 0 ? 'pos' : p.unrealizedPnl < 0 ? 'neg' : ''}">${fmt(p.unrealizedPnl)}</div>
-      </div>
-    `).join('');
-  } else {
-    $('#posCount').textContent = '0';
-    $('#positions').innerHTML = '<div style="color:var(--dim);padding:12px 0;">Flat — no open positions</div>';
+function updateQuotePrices() {
+  for (const sym of Object.keys(quotes)) {
+    const card = $(`.inst[data-symbol="${sym}"]`);
+    if (!card) continue;
+    const q = quotes[sym];
+    const le = card.querySelector('[data-q="last"]');
+    const be = card.querySelector('[data-q="bid"]');
+    const ae = card.querySelector('[data-q="ask"]');
+    if (le && q.last != null) le.textContent = fmt(q.last);
+    if (be && q.bid != null) be.textContent = fmt(q.bid);
+    if (ae && q.ask != null) ae.textContent = fmt(q.ask);
   }
 }
 
-function updateTrades(trades) {
-  if (!trades) return;
-  const summary = trades.summary || {};
-  $('#summary').innerHTML = `
-    <span class="summary-stat"><span class="summary-dot" style="background:#3fb950"></span>${summary.wins || 0}W</span>
-    <span class="summary-stat"><span class="summary-dot" style="background:#f85149"></span>${summary.losses || 0}L</span>
-    <span class="summary-stat">|</span>
-    <span class="summary-stat">${(trades.trades || []).filter(t => t.status === 'open').length} open</span>
-  `;
+function renderPositions(d) {
+  const el = $('#positions');
+  const countEl = $('#posCount');
+  if (!el) return;
+  const list = d?.positions || [];
+  if (countEl) countEl.textContent = list.length;
+  if (!list.length) {
+    el.innerHTML = '<div style="color:var(--dim);padding:12px 0;">Flat — no open positions</div>';
+    return;
+  }
+  el.innerHTML = list.map(p => `
+    <div class="pos-row">
+      <div class="pos-info">
+        <span class="pos-sym">${p.symbol}</span>
+        <span class="pos-dir pos-${(p.direction || '').toLowerCase()}">${(p.direction || '').toUpperCase()}</span>
+        <div class="pos-detail">Entry ${fmt(p.avgPrice)} · SL ${fmt(p.sl)} · TP ${fmt(p.tp)}</div>
+      </div>
+      <div class="pos-pnl ${p.unrealizedPnl > 0 ? 'pos' : p.unrealizedPnl < 0 ? 'neg' : ''}">${fmt(p.unrealizedPnl)}</div>
+    </div>
+  `).join('');
+}
 
-  $('#trades').innerHTML = (trades.trades || []).map(t => `
+function renderTrades(d) {
+  if (!d) return;
+  const s = d.summary || {};
+  const sumEl = $('#summary');
+  if (sumEl) {
+    sumEl.innerHTML = `
+      <span class="summary-stat"><span class="summary-dot" style="background:#3fb950"></span>${s.wins || 0}W</span>
+      <span class="summary-stat"><span class="summary-dot" style="background:#f85149"></span>${s.losses || 0}L</span>
+      <span class="summary-stat">|</span>
+      <span class="summary-stat">${(d.trades || []).filter(t => t.status === 'open').length} open</span>
+    `;
+  }
+  const el = $('#trades');
+  if (!el) return;
+  el.innerHTML = (d.trades || []).map(t => `
     <div class="trade-row">
       <div class="trade-left">
         <span class="trade-sym">${t.symbol}</span>
@@ -294,179 +315,127 @@ function updateTrades(trades) {
   `).join('');
 }
 
-function updateSignals(signals) {
-  if (!signals || !signals.signals) return;
-  const signalsEl = $('#signals');
-  if (!signalsEl) return;
-  signalsEl.innerHTML = signals.signals.map(s => `<div class="sig">${s}</div>`).join('');
-  signalsEl.scrollTop = signalsEl.scrollHeight;
+function renderSignals(d) {
+  if (!d?.signals) return;
+  const el = $('#signals');
+  if (!el) return;
+  el.innerHTML = d.signals.map(s => `<div class="sig">${s}</div>`).join('');
+  el.scrollTop = el.scrollHeight;
 }
 
-function updateSwingPoints(data) {
+function renderSwingPoints(d) {
   const el = $('#swingPoints');
   if (!el) return;
-  const rows = data?.swingPoints || data?.points || [];
+  // Adapt to multiple possible response shapes from bridge
+  const rows = d?.swingPoints || d?.points || d?.swings || d?.SwingPoints || (Array.isArray(d) ? d : []);
   if (!rows.length) {
     el.innerHTML = '<div style="color:var(--dim)">No swing points</div>';
     return;
   }
-  const recent = rows.slice(-8).reverse();
-  el.innerHTML = recent.map(sp => {
-    const label = sp.label || sp.type || sp.kind || 'SWING';
-    const price = sp.price ?? sp.value ?? null;
-    const ts = sp.time || sp.ts || '';
+  el.innerHTML = rows.slice(-10).reverse().map(sp => {
+    const label = sp.label || sp.type || sp.kind || sp.Type ||
+      (sp.direction === 'High' || sp.Direction === 'High' ? 'SH' :
+       sp.direction === 'Low' || sp.Direction === 'Low' ? 'SL' : 'SP');
+    const price = sp.price ?? sp.value ?? sp.Price ?? sp.Value ?? null;
+    const ts = sp.time || sp.ts || sp.Time || sp.Timestamp || '';
     return `<div class="sig">${label} ${fmt(price)} <span style="color:var(--dim)">${ts}</span></div>`;
   }).join('');
 }
 
-async function loadFastData() {
-  if (fastDataInFlight) {
-    pendingFastRefresh = true;
-    return;
-  }
-  fastDataInFlight = true;
-  try {
-    console.log('[loadFastData] Starting data fetch...');
-    const [status, account, positions, quotes] = await Promise.all([
-      api('/api/status'),
-      api('/api/account'),
-      api('/api/positions'),
-      api('/api/quotes')
-    ]);
-    updateStatus(status);
-    updateAccount(account);
-    updatePositions(positions);
-    if (quotes) {
-      latestQuotes = normalizeQuotes(quotes);
-      renderInstruments();
-    }
-    console.log('[loadFastData] UI update complete');
-  } catch (error) {
-    console.error('[loadFastData] Error:', error);
-  } finally {
-    fastDataInFlight = false;
-    if (pendingFastRefresh) {
-      pendingFastRefresh = false;
-      scheduleFastRefresh(250);
-    }
-  }
-}
+// ======================== WEBSOCKET ========================
 
-async function loadSlowData() {
-  if (slowDataInFlight) {
-    pendingSlowRefresh = true;
-    return;
-  }
-  slowDataInFlight = true;
-  try {
-    const [levels, trades, signals] = await Promise.all([
-      api('/api/levels', 12000),
-      api('/api/trades', 12000),
-      api('/api/signals', 12000),
-    ]);
-    if (levels && levels.instruments) {
-      latestLevels = levels.instruments;
-      renderInstruments();
-    }
-    updateTrades(trades);
-    updateSignals(signals);
-    await loadSwingPoints();
-  } catch (error) {
-    console.error('[loadSlowData] Error:', error);
-  } finally {
-    slowDataInFlight = false;
-    if (pendingSlowRefresh) {
-      pendingSlowRefresh = false;
-      scheduleSlowRefresh(750);
-    }
-  }
-}
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = `${proto}//${location.host}/api/ws`;
+  try { ws = new WebSocket(url); } catch { scheduleReconnect(); return; }
 
-async function loadSwingPoints() {
-  const data = await api(`/api/swing-points?symbol=${activeSymbol}`, 8000);
-  updateSwingPoints(data);
-}
-
-function scheduleFastRefresh(delayMs = 150) {
-  if (fastRefreshTimer) return;
-  const elapsed = Date.now() - lastFastRefreshAt;
-  const effectiveDelay = elapsed >= MIN_FAST_REFRESH_INTERVAL_MS
-    ? delayMs
-    : Math.max(delayMs, MIN_FAST_REFRESH_INTERVAL_MS - elapsed);
-  fastRefreshTimer = setTimeout(() => {
-    fastRefreshTimer = null;
-    lastFastRefreshAt = Date.now();
-    loadFastData();
-  }, effectiveDelay);
-}
-
-function scheduleSlowRefresh(delayMs = 500) {
-  if (slowRefreshTimer) return;
-  const elapsed = Date.now() - lastSlowRefreshAt;
-  const effectiveDelay = elapsed >= MIN_SLOW_REFRESH_INTERVAL_MS
-    ? delayMs
-    : Math.max(delayMs, MIN_SLOW_REFRESH_INTERVAL_MS - elapsed);
-  slowRefreshTimer = setTimeout(() => {
-    slowRefreshTimer = null;
-    lastSlowRefreshAt = Date.now();
-    loadSlowData();
-  }, effectiveDelay);
-}
-
-// WebSocket for real-time updates
-function initWebSocket() {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${protocol}//${window.location.host}/api/ws`;
-  
-  console.log('Connecting to WebSocket:', wsUrl);
-  ws = new WebSocket(wsUrl);
-  
   ws.onopen = () => {
-    console.log('✓ WebSocket connected');
-    wsReconnectAttempts = 0;
-    if (wsReconnectTimer) {
-      clearTimeout(wsReconnectTimer);
-      wsReconnectTimer = null;
-    }
+    console.log('WS connected');
+    wsAttempts = 0;
+    wsMessageCount = 0;
+    if (wsTimer) { clearTimeout(wsTimer); wsTimer = null; }
   };
-  
-  ws.onmessage = (event) => {
-    try {
-      if (typeof event.data === 'string' && event.data.length > 500000) {
-        console.warn('WebSocket message too large; dropped');
-        return;
-      }
-      const update = JSON.parse(event.data);
-      console.log('WebSocket update:', update.type);
-
-      if (update.type === 'quote') {
-        if (update.symbol) {
-          latestQuotes[update.symbol] = { ...latestQuotes[update.symbol], ...update };
-          renderInstruments();
-        }
-        scheduleFastRefresh(75);
-      } else if (update.type === 'position' || update.type === 'order') {
-        scheduleFastRefresh(150);
-      } else {
-        scheduleSlowRefresh(300);
-      }
-    } catch (e) {
-      console.error('WebSocket message error:', e);
-    }
-  };
-  
-  ws.onerror = (error) => {
-    console.error('WebSocket error:', error);
-  };
-  
-  ws.onclose = () => {
-    const baseDelay = Math.min(30000, 1000 * (2 ** wsReconnectAttempts));
-    const jitter = Math.floor(Math.random() * 500);
-    const delay = baseDelay + jitter;
-    wsReconnectAttempts = Math.min(wsReconnectAttempts + 1, 5);
-    console.log(`WebSocket disconnected, reconnecting in ${Math.round(delay / 1000)}s...`);
-    wsReconnectTimer = setTimeout(initWebSocket, delay);
-  };
+  ws.onmessage = onWsMessage;
+  ws.onerror = () => {};
+  ws.onclose = () => scheduleReconnect();
 }
 
-console.log('Dashboard script loaded');
+function onWsMessage(ev) {
+  let msg;
+  try { msg = JSON.parse(ev.data); } catch { return; }
+  wsMessageCount++;
+
+  // Log first 5 messages so we can diagnose bridge format in console
+  if (wsMessageCount <= 5) {
+    console.log('WS msg #' + wsMessageCount + ':', JSON.stringify(msg).slice(0, 400));
+  }
+
+  const type = (msg.type || msg.Type || msg.event || msg.Event || msg.messageType || '').toString().toLowerCase();
+  const rawSym = msg.symbol || msg.Symbol || msg.instrument || msg.Instrument || '';
+  const sym = normalizeSym(rawSym);
+
+  // Route by type
+  if (type === 'quote' || type === 'tick' || type === 'marketdata' || type === 'last' || type === 'bid' || type === 'ask') {
+    handleTick(sym, msg);
+  } else if (type === 'position' || type === 'positionupdate') {
+    pollFast();
+  } else if (type === 'order' || type === 'orderupdate' || type === 'execution' || type === 'fill') {
+    pollFast();
+  } else if (sym && hasPrice(msg)) {
+    // Unknown type but has price data — treat as tick
+    handleTick(sym, msg);
+  } else {
+    if (wsMessageCount <= 20) {
+      console.log('WS unhandled:', type || '(no type)', sym || '(no sym)', msg);
+    }
+  }
+}
+
+function normalizeSym(raw) {
+  if (!raw) return '';
+  // Strip contract suffixes: "ES 03-26" -> "ES", "NQ 06-26" -> "NQ"
+  return raw.split(/[\s]/)[0].replace(/\d{2}-\d{2}$/, '').toUpperCase();
+}
+
+function hasPrice(msg) {
+  return msg.last != null || msg.Last != null || msg.bid != null || msg.Bid != null ||
+    msg.price != null || msg.Price != null;
+}
+
+function handleTick(sym, msg) {
+  if (!sym) return;
+
+  const q = quotes[sym] || {};
+  // Handle both camelCase and PascalCase field names
+  for (const [lo, hi] of [['last', 'Last'], ['bid', 'Bid'], ['ask', 'Ask'], ['volume', 'Volume']]) {
+    if (msg[lo] != null) q[lo] = msg[lo];
+    else if (msg[hi] != null) q[lo] = msg[hi];
+  }
+  if (msg.price != null) q.last = msg.price;
+  if (msg.Price != null) q.last = msg.Price;
+  quotes[sym] = q;
+
+  // Targeted DOM update — no innerHTML rebuild
+  const card = $(`.inst[data-symbol="${sym}"]`);
+  if (card) {
+    const le = card.querySelector('[data-q="last"]');
+    const be = card.querySelector('[data-q="bid"]');
+    const ae = card.querySelector('[data-q="ask"]');
+    if (le && q.last != null) le.textContent = fmt(q.last);
+    if (be && q.bid != null) be.textContent = fmt(q.bid);
+    if (ae && q.ask != null) ae.textContent = fmt(q.ask);
+  }
+
+  // Live chart update for active symbol
+  if (sym === activeSymbol && q.last != null) {
+    tickChart(q.last);
+  }
+}
+
+function scheduleReconnect() {
+  if (wsTimer) return;
+  const delay = Math.min(30000, 1000 * (2 ** wsAttempts)) + Math.random() * 500;
+  wsAttempts = Math.min(wsAttempts + 1, 5);
+  console.log(`WS reconnecting in ${Math.round(delay / 1000)}s...`);
+  wsTimer = setTimeout(() => { wsTimer = null; connectWS(); }, delay);
+}

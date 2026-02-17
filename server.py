@@ -121,12 +121,73 @@ def _cached_stale(key: str, max_age: int = CACHE_STALE_TTL):
     return None
 
 
-def _safe_float(value: str) -> float | None:
+def _safe_float(value) -> float | None:
     try:
         n = float(value)
     except (TypeError, ValueError):
         return None
     return n if math.isfinite(n) else None
+
+
+def _normalize_symbol(sym: str) -> str:
+    """Strip contract month/year from NinjaTrader instrument name.
+
+    'ES 03-26' -> 'ES', 'NQ 06-26' -> 'NQ', 'ES' -> 'ES'
+    """
+    if not sym:
+        return sym
+    return sym.split()[0].upper()
+
+
+def _normalize_quotes(raw) -> dict[str, dict]:
+    """Normalize any bridge quote format to ``{symbol: {last, bid, ask, …}}``."""
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        for key in ("quotes", "Quotes", "data", "Data"):
+            inner = raw.get(key)
+            if inner is not None:
+                return _normalize_quotes(inner)
+        if raw and all(isinstance(v, dict) for v in raw.values()):
+            return {_normalize_symbol(k): v for k, v in raw.items()}
+        if "symbol" in raw or "Symbol" in raw:
+            sym = _normalize_symbol(raw.get("symbol") or raw.get("Symbol", ""))
+            if sym:
+                return {sym: raw}
+        return {}
+    if isinstance(raw, list):
+        result = {}
+        for item in raw:
+            if isinstance(item, dict):
+                sym = _normalize_symbol(item.get("symbol") or item.get("Symbol", ""))
+                if sym:
+                    result[sym] = item
+        return result
+    return {}
+
+
+def _normalize_candle(c) -> dict | None:
+    """Normalize a candle dict to ``{time, open, high, low, close}``."""
+    if not isinstance(c, dict):
+        return None
+    t = c.get("time") or c.get("Time") or c.get("t") or c.get("timestamp") or c.get("Timestamp")
+    o = _safe_float(c.get("open") if c.get("open") is not None else c.get("Open") if c.get("Open") is not None else c.get("o"))
+    h = _safe_float(c.get("high") if c.get("high") is not None else c.get("High") if c.get("High") is not None else c.get("h"))
+    lo = _safe_float(c.get("low") if c.get("low") is not None else c.get("Low") if c.get("Low") is not None else c.get("l"))
+    cl = _safe_float(c.get("close") if c.get("close") is not None else c.get("Close") if c.get("Close") is not None else c.get("c"))
+    if t is None or cl is None:
+        return None
+    result: dict = {"time": t, "close": cl}
+    if o is not None:
+        result["open"] = o
+    if h is not None:
+        result["high"] = h
+    if lo is not None:
+        result["low"] = lo
+    vol = c.get("volume") or c.get("Volume") or c.get("v")
+    if vol is not None:
+        result["volume"] = vol
+    return result
 
 
 def _bridge_record_result(ok: bool):
@@ -353,13 +414,14 @@ async def quotes():
     if cached:
         return cached
     data = await bridge_get("/quotes")
-    if data:
-        return _set("quotes", data)
+    normalized = _normalize_quotes(data) if data else {}
+    if normalized:
+        return _set("quotes", {"quotes": normalized})
     stale = _cached_stale("quotes")
     if stale:
         logger.warning("Serving stale quotes data")
         return stale
-    return _set("quotes", {})
+    return _set("quotes", {"quotes": {}})
 
 
 @app.get("/api/levels")
@@ -393,14 +455,13 @@ async def levels():
                 "pdc": pdc,
             }
 
-    quote_data = await bridge_get("/quotes")
-    if quote_data:
-        for inst in instruments.values():
-            q = quote_data.get(inst["symbol"])
-            if q:
-                inst["last"] = q.get("last")
-                inst["bid"] = q.get("bid")
-                inst["ask"] = q.get("ask")
+    quote_map = _normalize_quotes(await bridge_get("/quotes"))
+    for inst in instruments.values():
+        q = quote_map.get(inst["symbol"])
+        if q:
+            inst["last"] = q.get("last") or q.get("Last")
+            inst["bid"] = q.get("bid") or q.get("Bid")
+            inst["ask"] = q.get("ask") or q.get("Ask")
 
     return _set("levels", {"instruments": list(instruments.values())})
 
@@ -648,25 +709,23 @@ async def candles(
             return stale
         return {"candles": [], "ema20": [], "ema50": [], "ema200": []}
 
-    agg = data["candles"]
-    if not isinstance(agg, list):
-        logger.warning("Unexpected candles payload type: %s", type(agg).__name__)
+    raw_candles = data.get("candles") or data.get("Candles") or data.get("bars") or data.get("Bars")
+    if raw_candles is None:
+        raw_candles = data if isinstance(data, list) else []
+    if not isinstance(raw_candles, list):
+        logger.warning("Unexpected candles payload type: %s", type(raw_candles).__name__)
         return _set(cache_key, {"candles": [], "ema20": [], "ema50": [], "ema200": []})
-    if not agg:
+    if not raw_candles:
         return _set(cache_key, {"candles": [], "ema20": [], "ema50": [], "ema200": []})
 
     normalized = []
     closes = []
-    for candle in agg:
-        if not isinstance(candle, dict):
-            continue
-        if "time" not in candle or "close" not in candle:
-            continue
-        close = _safe_float(str(candle["close"]))
-        if close is None:
+    for raw in raw_candles:
+        candle = _normalize_candle(raw)
+        if candle is None:
             continue
         normalized.append(candle)
-        closes.append(close)
+        closes.append(candle["close"])
 
     if len(normalized) > MAX_CANDLES:
         normalized = normalized[-MAX_CANDLES:]
@@ -722,7 +781,12 @@ async def websocket_proxy(websocket: WebSocket):
             max_size=MAX_BRIDGE_BYTES,
         ) as bridge_ws:
             async def forward_to_client():
+                msg_count = 0
                 async for msg in bridge_ws:
+                    msg_count += 1
+                    if msg_count <= 3:
+                        preview = msg[:300] if isinstance(msg, str) else repr(msg)[:300]
+                        logger.info("bridge WS msg #%d: %s", msg_count, preview)
                     try:
                         await asyncio.wait_for(websocket.send_text(msg), timeout=1.0)
                     except asyncio.TimeoutError:
